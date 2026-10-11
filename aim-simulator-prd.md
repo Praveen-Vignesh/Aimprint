@@ -54,9 +54,13 @@ The trainer itself must feel legitimately usable — targets, hit feedback, and 
 - **(v2)** Configurable sensitivity: mouse DPI plus in-game sens on the Valorant scale
   (0.07°/count), with eDPI and cm/360 shown to the player
 - **(v2)** Difficulty state manager (easy / medium / hard) driving per-routine parameters
-- **(v2)** Four training routines: static flicking, dynamic reflex, reactive strafing,
-  and target switching
-- **(v2)** Multiple concurrent targets, moving targets, and target time-to-live
+- **(v2)** Training routines. Five were designed; **three ship for the data-collection
+  campaign**: precision flick, dynamic reflex (time-to-live), and reactive strafing (a single
+  moving target). The two multi-concurrent-target routines — static flicking and target
+  switching — are **withheld** from the menu (their code is retained) because their engaged-target
+  telemetry is ambiguous; see `AUDIT-2026-10.md` #10.
+- **(v2)** A single moving target (strafing) and target time-to-live (spidershot). Multiple
+  concurrent targets exist in code but are withheld with the two routines above.
 
 ### Out of scope (do NOT build)
 - Python backend, FastAPI, Hugging Face Spaces

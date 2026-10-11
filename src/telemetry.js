@@ -20,10 +20,13 @@
 const ANGLE_PRECISION = 1e5;
 const POSITION_PRECISION = 1e3;
 // input_events carry sub-frame timing — the whole reason to record them apart
-// from the per-frame trajectory — so their timestamps keep 0.01 ms resolution
-// rather than the whole-millisecond rounding trajectory `t` uses. At a 1000 Hz
-// poll rate samples land ~1 ms apart, which whole-ms rounding would collapse.
-const INPUT_TIME_PRECISION = 1e2;
+// from the per-frame trajectory. sampling_version 4 stores each timestamp as an
+// INTEGER number of tenths of a millisecond (0.1 ms resolution): fine enough to
+// keep ~1 ms poll gaps distinct, but an integer, which is what lets the stream
+// be delta-encoded losslessly (see inputsToColumnar — integer cumsum is exact,
+// a float cumsum over hundreds of terms would drift). Whole-ms rounding, which
+// trajectory `t` still uses, would collapse adjacent 1 ms samples.
+const INPUT_TIME_PRECISION = 1e1;
 
 function roundTo(value, precision) {
   return value === null ? null : Math.round(value * precision) / precision;
@@ -97,10 +100,13 @@ export function createTelemetry() {
     // One entry per raw pointer sample (getCoalescedEvents), at the native
     // polling rate — sub-frame timing that the per-frame trajectory destroys.
     // `eventTime` is the sample's own DOMHighResTimeStamp, off the same clock as
-    // segmentStart, so inter-arrival gaps survive.
+    // segmentStart, so inter-arrival gaps survive. `t` is stored as an INTEGER
+    // number of tenths of a millisecond: rounded to the final resolution HERE,
+    // before any delta is taken, so the delta-encode in inputsToColumnar is
+    // exact (round-then-delta, never delta-then-round).
     recordInput(eventTime, dx, dy) {
       inputs.push({
-        t: Math.round((eventTime - segmentStart) * INPUT_TIME_PRECISION) / INPUT_TIME_PRECISION,
+        t: Math.round((eventTime - segmentStart) * INPUT_TIME_PRECISION),
         dx,
         dy
       });
@@ -127,7 +133,14 @@ export function createTelemetry() {
 // Turns the per-frame buffer into the COLUMNAR shape schema.sql stores: parallel
 // arrays keyed by field name rather than an array of per-sample objects. Roughly
 // a third of the size (no repeated keys) and it loads straight into numpy.
-function toColumnar(frames) {
+//
+// `movesTargets` (sampling_version 4): when false, the engaged target is static
+// for the whole segment, so tx/ty/tz is one value repeated frame_count times —
+// and that value is already in the segment's `targets` snapshot at
+// engaged_index. The three columns are then OMITTED, and the offline reader
+// fills them from the snapshot. When true (strafing, switching) the target moves
+// and the per-frame positions are the only record, so they are kept.
+function toColumnar(frames, movesTargets = false) {
   const n = frames.length;
   const columns = {
     t: new Array(n),
@@ -135,11 +148,14 @@ function toColumnar(frames) {
     dy: new Array(n),
     yaw: new Array(n),
     pitch: new Array(n),
-    tx: new Array(n),
-    ty: new Array(n),
-    tz: new Array(n),
     on: new Array(n)
   };
+
+  if (movesTargets) {
+    columns.tx = new Array(n);
+    columns.ty = new Array(n);
+    columns.tz = new Array(n);
+  }
 
   for (let i = 0; i < n; i++) {
     const frame = frames[i];
@@ -148,10 +164,12 @@ function toColumnar(frames) {
     columns.dy[i] = frame.dy;
     columns.yaw[i] = frame.yaw;
     columns.pitch[i] = frame.pitch;
-    columns.tx[i] = frame.tx;
-    columns.ty[i] = frame.ty;
-    columns.tz[i] = frame.tz;
     columns.on[i] = frame.on;
+    if (movesTargets) {
+      columns.tx[i] = frame.tx;
+      columns.ty[i] = frame.ty;
+      columns.tz[i] = frame.tz;
+    }
   }
 
   return columns;
@@ -190,27 +208,53 @@ function toBoardColumnar(boardFrames) {
   return { x, y, z };
 }
 
-// Same columnar shape for the raw input stream: {t, dx, dy} parallel arrays.
+// Columnar + DELTA-encoded raw input stream (sampling_version 4): {t0, dt, dx,
+// dy}, where every t value is an integer number of tenths of a millisecond.
+// input.t is already that integer (recordInput rounds before storing), so:
+//   t0    = the first sample's absolute time
+//   dt[i] = input[i].t - input[i-1].t, with dt[0] defined as 0
+// and the reader reconstructs absolute ms as (t0 + cumsum(dt)) / 10. The gaps
+// are ~10 (≈1 ms at 1000 Hz), one or two digits each, versus a 4–5 digit
+// absolute value — this is the single biggest row in the database and the delta
+// cuts it by well over half. len(dt) == n == event_count exactly, which the
+// segments_input_events_len_matches CHECK relies on. Decoding happens only in
+// the offline archive job, so nothing downstream sees the delta form.
 function inputsToColumnar(inputs) {
   const n = inputs.length;
-  const columns = { t: new Array(n), dx: new Array(n), dy: new Array(n) };
+  if (n === 0) return { t0: 0, dt: [], dx: [], dy: [] };
+
+  const dt = new Array(n);
+  const dx = new Array(n);
+  const dy = new Array(n);
+  const t0 = inputs[0].t;
+  let prev = t0;
 
   for (let i = 0; i < n; i++) {
     const input = inputs[i];
-    columns.t[i] = input.t;
-    columns.dx[i] = input.dx;
-    columns.dy[i] = input.dy;
+    dt[i] = input.t - prev; // dt[0] === 0
+    prev = input.t;
+    dx[i] = input.dx;
+    dy[i] = input.dy;
   }
 
-  return columns;
+  return { t0, dt, dx, dy };
 }
 
 // Assembles the `sessions` row: everything scoped to one timed run.
 // app_version and sampling_version are sent explicitly (not left to the table
 // defaults) so a row records the exact code that produced it — the whole point
-// of the columns. poll_hz stays null: it is derived offline from input_events.
-// subject_id is stamped in supabase.js from the resolved profile.
+// of the columns. subject_id is stamped in supabase.js from the resolved
+// profile, and `id` is minted by game.js so segments can be enqueued against it
+// before the session insert resolves.
+//
+// poll_hz is DELIBERATELY NOT in the payload. It is service-written (derived
+// offline from input_events) and the column-level insert grant in schema.sql
+// does not include it — so sending it, even as null, names an ungranted column
+// and PostgREST rejects the whole insert with 42501, which the outbox treats as
+// permanent and drops. Same reasoning excludes started_at, ended_at and
+// bot_mode, which the client never sent anyway. Do not add poll_hz back here.
 export function buildSessionPayload({
+  id = undefined,
   routine,
   difficulty,
   routineConfig = null,
@@ -220,7 +264,6 @@ export function buildSessionPayload({
   cmPer360 = null,
   fovDeg = null,
   refreshHz = null,
-  pollHz = null,
   deviceFingerprint = null,
   userAgent = null,
   platform = null,
@@ -242,7 +285,6 @@ export function buildSessionPayload({
     cm_per_360: cmPer360,
     fov_deg: fovDeg,
     refresh_hz: refreshHz,
-    poll_hz: pollHz,
     device_fingerprint: deviceFingerprint,
     user_agent: userAgent,
     platform,
@@ -251,6 +293,12 @@ export function buildSessionPayload({
     device_pixel_ratio: devicePixelRatio,
     app_version: appVersion
   };
+
+  // The client-minted session uuid (game.js). Omitted when absent so a caller
+  // that does not supply one still gets the table's gen_random_uuid() default.
+  if (id !== undefined && id !== null) {
+    payload.id = id;
+  }
 
   // sampling_version is NOT NULL with a table default; omit the key when unset
   // so the default applies rather than sending a null that violates it.
@@ -279,7 +327,10 @@ export function buildSegmentPayload({
   engagedIndex = null,
   frames,
   inputs = [],
-  boardFrames = []
+  boardFrames = [],
+  // Whether the engaged target moved during the segment. Drives whether
+  // trajectory carries tx/ty/tz (moving) or omits it (static — see toColumnar).
+  movesTargets = false
 }) {
   // Nullable by design: a session may run without raw capture. Store null rather
   // than an empty stream so "not captured" is distinct from "captured nothing".
@@ -300,7 +351,7 @@ export function buildSegmentPayload({
     target_count: targetCount,
     targets,
     engaged_index: engagedIndex,
-    trajectory: toColumnar(frames),
+    trajectory: toColumnar(frames, movesTargets),
     input_events: hasInputs ? inputsToColumnar(inputs) : null,
     board_trajectory: hasBoard ? toBoardColumnar(boardFrames) : null,
     frame_count: frames.length,

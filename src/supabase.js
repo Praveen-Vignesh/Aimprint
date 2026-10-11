@@ -38,6 +38,16 @@ function sleep(ms) {
 // users, so the schema needs no change for this.
 
 let accessToken = null;
+// The user_id signed in right now, cached from onAuthStateChange so the outbox
+// can scope queued rows to their owner SYNCHRONOUSLY (createOutbox currentOwner).
+// On a shared recruitment machine this is what stops one participant's queued
+// rows being thrown at the database under the next participant's token.
+let currentUserId = null;
+
+function currentOwner() {
+  return currentUserId;
+}
+
 // { status: 'loading' | 'signed_in' | 'signed_out', email, userId, consented }
 //
 // `consented` mirrors profiles.consent_version: true once a version is stamped,
@@ -79,6 +89,7 @@ if (client !== null) {
   // 'loading' as soon as the persisted session is read from localStorage.
   client.auth.onAuthStateChange((_event, session) => {
     accessToken = session?.access_token ?? null;
+    currentUserId = session?.user?.id ?? null;
 
     if (session?.user) {
       // TOKEN_REFRESHED fires roughly hourly, and supabase-js also re-emits for
@@ -117,6 +128,11 @@ if (client !== null) {
       // in, with the correct value sitting in the database the whole time.
       // setTimeout lets the lock release first.
       setTimeout(refreshConsent, 0);
+      // This account is now the current owner, so any rows held for it (from a
+      // prior tab or a previous participant's turn on this machine) can deliver.
+      // Deferred for the same lock reason, and because the outbox consts below
+      // are initialised by the time a timeout fires.
+      setTimeout(kickOutboxes, 0);
       return;
     }
 
@@ -388,13 +404,63 @@ function sendSegmentsKeepalive(rows) {
   }).catch(() => {});
 }
 
+// The session insert. A plain INSERT like segments, and idempotent the same way:
+// the id is the primary key (minted by game.js), so a re-sent session raises
+// 23505, which the outbox settles as "already delivered". No .select(): keeping
+// it minimal, and it means a segment's session can land without a read round
+// trip. The row is durable now (its own outbox + IndexedDB store), so a
+// transient failure at the start of a run no longer discards the whole session.
+async function sendSessions(rows) {
+  const { error } = await client.from('sessions').insert(rows);
+
+  if (error) {
+    const failure = new Error(error.message);
+    failure.code = error.code;
+    failure.details = error.details;
+    throw failure;
+  }
+}
+
+// Keepalive counterpart for session rows (tiny; a run has one). Delivering the
+// session on unload means the next load's segment replay does not 23503-wait.
+function sendSessionsKeepalive(rows) {
+  if (accessToken === null || typeof fetch === 'undefined') return;
+
+  fetch(`${url}/rest/v1/sessions`, {
+    method: 'POST',
+    keepalive: true,
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: anonKey,
+      Authorization: `Bearer ${accessToken}`,
+      Prefer: 'return=minimal'
+    },
+    body: JSON.stringify(rows)
+  }).catch(() => {});
+}
+
+// Nudges both queues to deliver. Called when an account signs in (its held rows
+// can now go) and reused by the exported flushes. A hoisted declaration so the
+// auth callback above can name it; it only reads the outbox consts below when
+// actually invoked (always via setTimeout), by which point they are initialised.
+function kickOutboxes() {
+  if (sessionOutbox !== null) sessionOutbox.flush();
+  if (outbox !== null) outbox.flush();
+}
+
+// One IndexedDB database, two object stores — segments and the session rows they
+// reference — each with its own outbox. currentOwner scopes both queues to the
+// signed-in account (see outbox.js).
+const idb = client === null ? null : createIdbStore();
+
 const outbox =
   client === null
     ? null
     : createOutbox({
         send: sendSegments,
         sendKeepalive: sendSegmentsKeepalive,
-        store: createIdbStore(),
+        store: idb === null ? null : idb.forStore('segments'),
+        currentOwner,
         onError: (error) => console.warn('Segment batch delivery failed, will retry:', error.message),
         onDrop: (row, error) =>
           console.warn(
@@ -404,50 +470,79 @@ const outbox =
           )
       });
 
+const sessionOutbox =
+  client === null
+    ? null
+    : createOutbox({
+        send: sendSessions,
+        sendKeepalive: sendSessionsKeepalive,
+        store: idb === null ? null : idb.forStore('sessions'),
+        // A session's idempotency key is its own id, not (session_id, index).
+        keyOf: (row) => row.id,
+        isValid: (row) => row !== null && row !== undefined && row.id !== null && row.id !== undefined,
+        currentOwner,
+        onError: (error) => console.warn('Session delivery failed, will retry:', error.message),
+        onDrop: (row, error) =>
+          console.warn(
+            `Session ${row.id} was rejected permanently (${error.code}) and has been dropped:`,
+            error.message
+          )
+      });
+
 // Replays anything a previous page load left unacknowledged in IndexedDB.
+// Sessions first, so a replayed segment finds its session already present rather
+// than taking the 23503-wait round trip (it would still recover, via the
+// transient-FK retry, but this is cheaper).
 export function initTelemetryOutbox() {
+  if (sessionOutbox !== null) sessionOutbox.init();
   if (outbox !== null) outbox.init();
 }
 
-// A prompt flush (e.g. at session end) and a keepalive flush (page unload).
+// A prompt flush (e.g. at session end) and a keepalive flush (page unload). Both
+// cover the session queue and the segment queue.
 export function flushTelemetry() {
-  if (outbox !== null) return outbox.flush();
+  if (sessionOutbox !== null) sessionOutbox.flush();
+  if (outbox !== null) outbox.flush();
 }
 
 export function flushTelemetryKeepalive() {
+  if (sessionOutbox !== null) sessionOutbox.flushKeepalive();
   if (outbox !== null) outbox.flushKeepalive();
 }
 
-// Opens a session row and resolves to its id, or null when persistence is
-// unavailable (not configured, or not signed in). Awaited by every segment,
-// since each references this id. subject_id is stamped here from the resolved
-// profile so the RLS insert check (subject_id = current_subject_id()) passes.
+// Hands a session row to the durable session outbox. The id is already on the
+// payload (minted by game.js), so this no longer resolves and returns one — the
+// segments reference the client-minted id directly and never wait on the insert.
+// A failed delivery is retried from IndexedDB instead of discarding the whole
+// run, which is the bug this replaces. subject_id is stamped here from the
+// resolved profile so the RLS insert check (subject_id = current_subject_id())
+// passes, and the owner is recorded for queue scoping.
+//
+// A null auth means no profile resolved for the signed-in account — the row
+// cannot satisfy RLS and there is nothing to deliver, so it is skipped. In the
+// normal path the game only starts for a consented, signed-in account, so auth
+// resolves; this guards the edge where it does not.
 export async function insertSession(payload) {
+  if (sessionOutbox === null) return;
+
   const auth = await ensureAuth();
-  if (auth === null) return null;
-
-  const { data, error } = await client
-    .from('sessions')
-    .insert({ ...payload, subject_id: auth.subjectId })
-    .select('id')
-    .single();
-
-  if (error) {
-    console.warn('Session insert failed:', error.message);
-    return null;
+  if (auth === null) {
+    console.warn(
+      'Session not queued: no profile resolved for the signed-in account; its telemetry cannot be delivered.'
+    );
+    return;
   }
 
-  return data.id;
+  sessionOutbox.enqueue({ ...payload, subject_id: auth.subjectId }, auth.userId);
 }
 
-// Awaits the session id, then hands the row to the durable outbox. Never blocks
-// the game loop: the caller passes the still-in-flight session promise. A null
-// session id (the insert was dropped, or no auth session resolved) discards the row.
-export async function insertSegment(sessionIdPromise, payload) {
-  if (outbox === null) return;
+// Hands one segment row to the durable outbox. Synchronous now: the session id
+// is known at the call site (minted in game.js), so there is no promise to await
+// and the game loop never blocks. The segment may reach the database before its
+// session row — a 23503 the outbox treats as transient and retries. The owning
+// user is recorded in the envelope for queue scoping.
+export function insertSegment(sessionId, payload) {
+  if (outbox === null || sessionId === null || sessionId === undefined) return;
 
-  const sessionId = await sessionIdPromise;
-  if (sessionId === null) return;
-
-  outbox.enqueue({ ...payload, session_id: sessionId });
+  outbox.enqueue({ ...payload, session_id: sessionId }, currentUserId);
 }

@@ -64,16 +64,30 @@ export const TRACK_WINDOW_MS = 1000;
 // mirrors sessions.sampling_version.
 //
 // 3: timed sessions. The frame clock excludes paused time, so a segment's `t`
-// and its started_at_ms are active-play milliseconds, not wall clock.
+//    and its started_at_ms are active-play milliseconds, not wall clock.
+// 4: storage-shrink encoding. input_events is delta-encoded as {t0, dt, dx, dy}
+//    with t0/dt in integer TENTHS of a millisecond (0.1 ms resolution, below the
+//    ~1 ms poll floor), and the per-frame tx/ty/tz columns are OMITTED for
+//    static-target routines (flick, spidershot) — the engaged target is
+//    stationary within a segment, so its position already lives in `targets`.
+//    Both are lossless in signal; both change the stored SHAPE, so the version
+//    moves and any v3 row is excluded from a v4 training pull rather than
+//    silently decoded wrong. Decoding lives only in the offline archive job.
 export const APP_VERSION = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : 'dev';
-export const SAMPLING_VERSION = 3;
+export const SAMPLING_VERSION = 4;
 
 // Fixed-duration sessions. The player picks one of these on the home screen and
 // it is stamped on the session row as planned_duration_ms — INTENT recorded at
 // start, because the client can only write `sessions` at insert time (there is
 // no update policy). Whether the run was actually completed is derived offline.
-export const SESSION_DURATIONS_MIN = [1, 5, 10, 15];
-export const DEFAULT_SESSION_DURATION_MIN = 10;
+// The 1-minute option was dropped: it is too short to be a useful observation
+// and only adds a nuisance covariate. The default is 5 (not 10) because the
+// binding constraint is sessions-per-subject across separate days, and a 5-min
+// run is one a contributor will actually repeat; a 10-min run is where they
+// quietly drop out. planned_duration_ms is on the session row, so a mixed set of
+// lengths stays filterable offline regardless.
+export const SESSION_DURATIONS_MIN = [5, 10, 15];
+export const DEFAULT_SESSION_DURATION_MIN = 5;
 export const MS_PER_MINUTE = 60000;
 
 // A run reaching this fraction of its planned duration counts as completed.

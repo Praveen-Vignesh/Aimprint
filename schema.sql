@@ -231,6 +231,75 @@ begin
   end if;
 end $$;
 
+-- merged_into integrity. The training view collapses a subject onto its
+-- survivor with coalesce(merged_into, subject_id), which resolves EXACTLY ONE
+-- level: with A->B and B->C, A collapses to B but C stays separate, so one
+-- person lands on both sides of a GroupKFold split. For the bot detector that
+-- silently inflates accuracy; for biometric identification it is fatal, since
+-- telling people apart IS the task. These two guards pin the chain depth at 1.
+--
+-- Self-reference is a plain CHECK (a subject cannot be its own survivor).
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+     where conrelid = 'public.subjects'::regclass
+       and conname = 'subjects_merged_into_not_self'
+  ) then
+    alter table public.subjects
+      add constraint subjects_merged_into_not_self
+      check (merged_into is distinct from subject_id);
+  end if;
+end $$;
+
+-- Chain and fan-in need a trigger, because a CHECK cannot read other rows. It
+-- rejects (a) pointing at a subject that is itself already merged, and (b)
+-- merging a subject that is already somebody else's survivor — together that is
+-- depth <= 1 in both directions, which is exactly what the view's one-level
+-- coalesce assumes. SECURITY DEFINER with an empty search_path (every reference
+-- is schema-qualified; pg_catalog is always implicitly searched).
+create or replace function public.enforce_merge_depth()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if new.merged_into is null then
+    return new;
+  end if;
+
+  -- (a) the survivor must itself be canonical.
+  if exists (
+    select 1 from public.subjects
+     where subject_id = new.merged_into
+       and merged_into is not null
+  ) then
+    raise exception
+      'cannot merge % into %, which is itself merged (no merge chains)',
+      new.subject_id, new.merged_into;
+  end if;
+
+  -- (b) this subject must not already be a survivor others point at.
+  if exists (
+    select 1 from public.subjects
+     where merged_into = new.subject_id
+  ) then
+    raise exception
+      'cannot merge %, which is already the survivor of another subject',
+      new.subject_id;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists subjects_enforce_merge_depth on public.subjects;
+
+create trigger subjects_enforce_merge_depth
+  before insert or update of merged_into on public.subjects
+  for each row execute function public.enforce_merge_depth();
+
 -- ---------------------------------------------------------------------------
 -- Labelling a subject  (service key / SQL editor ONLY)
 -- ---------------------------------------------------------------------------
@@ -311,7 +380,7 @@ create or replace function public.handle_new_user()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = ''
 as $$
 declare
   new_subject uuid;
@@ -327,6 +396,31 @@ drop trigger if exists on_auth_user_created on auth.users;
 create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
+
+-- Repair any auth.users row that has no profile. The drop/create of the trigger
+-- above has a window (it holds ACCESS EXCLUSIVE on auth.users, so a signup in
+-- that window BLOCKS rather than fails, but a signup that slipped through an
+-- earlier run on an older file would have no subjects and no profiles row) — and
+-- from then on the client resolves a null subject_id and silently drops every
+-- row that account ever produces. This heals it. Idempotent (a run with no
+-- orphans is a no-op) and safe to leave in the file permanently; it mirrors
+-- handle_new_user() exactly, so a repaired user lands at the same default-deny
+-- kind='unknown', kind_source='default'. Confirm zero orphans with the query in
+-- this file's header after every run.
+do $$
+declare
+  orphan record;
+  new_subject uuid;
+begin
+  for orphan in
+    select u.id from auth.users u
+      left join public.profiles p on p.user_id = u.id
+     where p.user_id is null
+  loop
+    insert into public.subjects default values returning subject_id into new_subject;
+    insert into public.profiles (user_id, subject_id) values (orphan.id, new_subject);
+  end loop;
+end $$;
 
 -- The subject of the caller. SECURITY DEFINER so the RLS policies below can
 -- read profiles without granting the client select on it.
@@ -348,9 +442,29 @@ returns uuid
 language sql
 stable
 security definer
-set search_path = public
+set search_path = ''
 as $$
   select subject_id from public.profiles where user_id = auth.uid();
+$$;
+
+-- The consent version of the caller, or null if they have never consented. Same
+-- SECURITY DEFINER / empty-search_path / scalar-subquery discipline as
+-- current_subject_id(): the sessions insert policy calls it to refuse telemetry
+-- from an unconsented account AT THE DATABASE, not only in the client, where
+-- canPlay() / applyStartGate() already gate it. Deliberately returns the version
+-- rather than a boolean so the policy can test for existence; it compares
+-- against NULL, never against a specific version, because the database has no
+-- business knowing CONSENT_VERSION — currency stays a client concern (a bumped
+-- version re-prompts in the client), while the EXISTENCE of consent becomes an
+-- unconditional server-side precondition for writing biometric data.
+create or replace function public.current_consent_version()
+returns text
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select consent_version from public.profiles where user_id = auth.uid();
 $$;
 
 -- Consent durability. profiles.consent_version is where the client writes (it
@@ -370,7 +484,7 @@ create or replace function public.mirror_consent_to_subject()
 returns trigger
 language plpgsql
 security definer
-set search_path = public
+set search_path = ''
 as $$
 begin
   if new.consent_version is not null
@@ -488,7 +602,7 @@ create table if not exists public.sessions (
   -- Stamp of the code that produced the session. Without it, a change to the
   -- sampler or to difficulty.js silently mixes incomparable rows into one set.
   app_version text not null default 'unknown',
-  sampling_version int not null default 3
+  sampling_version int not null default 4
 );
 
 -- Additive migration for databases created before timed sessions shipped.
@@ -496,10 +610,11 @@ create table if not exists public.sessions (
 -- column has to be added explicitly for a re-run to upgrade in place.
 alter table public.sessions add column if not exists planned_duration_ms int;
 
--- The default means "what this deployment's client produces". Leaving it at 2
--- would mislabel any row inserted without the key as v2 data. Idempotent, and it
--- does not rewrite existing rows.
-alter table public.sessions alter column sampling_version set default 3;
+-- The default means "what this deployment's client produces", now 4 (the client
+-- always sends it explicitly, so this only covers a row inserted without the key;
+-- leaving it at 3 would mislabel such a row as pre-shrink v3 data). Idempotent,
+-- and it does not rewrite existing rows — old v3 rows keep sampling_version 3.
+alter table public.sessions alter column sampling_version set default 4;
 
 -- dpi/sens feed sensitivity.js's cm_per_360 derivation directly; a zero or
 -- negative value would divide-by-zero or silently invert it downstream.
@@ -516,6 +631,22 @@ begin
                   where conrelid = 'public.sessions'::regclass
                     and conname = 'sessions_sens_positive') then
     alter table public.sessions add constraint sessions_sens_positive check (sens > 0);
+  end if;
+  -- routine/difficulty are free text on the wire; a typo would mint a silent
+  -- cohort that quietly splits the dataset. gridshot and switching stay in the
+  -- allowlist: the code still exists (withheld from the UI, see routines/index.js)
+  -- and any pre-existing rows must still validate.
+  if not exists (select 1 from pg_constraint
+                  where conrelid = 'public.sessions'::regclass
+                    and conname = 'sessions_routine_allowed') then
+    alter table public.sessions add constraint sessions_routine_allowed
+      check (routine in ('flick', 'gridshot', 'spidershot', 'strafing', 'switching'));
+  end if;
+  if not exists (select 1 from pg_constraint
+                  where conrelid = 'public.sessions'::regclass
+                    and conname = 'sessions_difficulty_allowed') then
+    alter table public.sessions add constraint sessions_difficulty_allowed
+      check (difficulty in ('easy', 'medium', 'hard'));
   end if;
 end $$;
 
@@ -660,6 +791,74 @@ begin
   end if;
 end $$;
 
+-- Shape guards. Each row states a count AND separately carries the array it
+-- counts; these make the database reject a row where the two disagree, so an
+-- assembly bug in telemetry.js is caught at write time rather than surfacing
+-- months later as a malformed feature in the pipeline — against data that, by
+-- then, cannot be re-collected.
+--
+-- The `?` (key-exists) test is LOAD-BEARING: jsonb_array_length(null) returns
+-- null, and a null expression SATISFIES a CHECK (a check fails only when it is
+-- false), so a blob that is present but missing its key would pass a bare
+-- length comparison. `? 'dt'`/`? 't'` turns that into a hard failure.
+--
+-- input_events uses key 'dt' because sampling_version 4 delta-encodes it:
+-- {t0, dt:[...], dx, dy} with dt[0]=0, so len(dt) == event_count exactly. The
+-- trajectory key stays 't'. board_trajectory is {x,y,z} of per-target arrays,
+-- so its outer length is target_count.
+--
+-- ALL FIVE are NOT VALID, and that is load-bearing, not a convenience. The
+-- table is NOT empty: a live database may already hold pre-v4 rows whose
+-- input_events is the OLD shape ({t, dx, dy} — absolute t, no 'dt' key), which
+-- the input_events check rejects. NOT VALID enforces the shape on every future
+-- INSERT/UPDATE (which are all v4 and conform) while skipping the scan of
+-- existing rows — so the migration does not fail on history, and the append-only
+-- v3 rows are grandfathered. They are excluded from a v4 training pull by
+-- sampling_version and will be pruned anyway, so there is nothing to gain from
+-- validating against them. Do NOT `validate constraint` these while any pre-v4
+-- row remains; it would scan every row and TOASTed blob under ACCESS EXCLUSIVE
+-- and fail on the old input_events shape. A genuinely fresh (empty) database
+-- loses nothing by their being NOT VALID — there are no rows to validate.
+do $$
+begin
+  if not exists (select 1 from pg_constraint
+                  where conrelid = 'public.segments'::regclass
+                    and conname = 'segments_targets_len_matches') then
+    alter table public.segments add constraint segments_targets_len_matches
+      check (jsonb_array_length(targets) = target_count) not valid;
+  end if;
+  if not exists (select 1 from pg_constraint
+                  where conrelid = 'public.segments'::regclass
+                    and conname = 'segments_trajectory_len_matches') then
+    alter table public.segments add constraint segments_trajectory_len_matches
+      check (trajectory ? 't' and jsonb_array_length(trajectory -> 't') = frame_count) not valid;
+  end if;
+  if not exists (select 1 from pg_constraint
+                  where conrelid = 'public.segments'::regclass
+                    and conname = 'segments_input_events_len_matches') then
+    alter table public.segments add constraint segments_input_events_len_matches
+      check (
+        input_events is null
+        or (input_events ? 'dt' and jsonb_array_length(input_events -> 'dt') = event_count)
+      ) not valid;
+  end if;
+  if not exists (select 1 from pg_constraint
+                  where conrelid = 'public.segments'::regclass
+                    and conname = 'segments_board_trajectory_len_matches') then
+    alter table public.segments add constraint segments_board_trajectory_len_matches
+      check (
+        board_trajectory is null
+        or jsonb_array_length(board_trajectory -> 'x') = target_count
+      ) not valid;
+  end if;
+  if not exists (select 1 from pg_constraint
+                  where conrelid = 'public.segments'::regclass
+                    and conname = 'segments_engaged_index_in_range') then
+    alter table public.segments add constraint segments_engaged_index_in_range
+      check (engaged_index is null or (engaged_index >= 0 and engaged_index < target_count)) not valid;
+  end if;
+end $$;
+
 -- TOAST compression for the three payload columns. Every one of these blobs is
 -- far over the ~2 kB TOAST threshold, so all of them are compressed and pushed
 -- out of line on every insert — which makes the compressor a per-insert CPU
@@ -683,6 +882,18 @@ exception when others then
   raise notice 'lz4 compression unavailable (%), leaving default pglz', sqlerrm;
 end $$;
 
+-- Autovacuum tuning for the archive-and-prune staging model (see STORAGE.md).
+-- On Free tier segments is a ROLLING BUFFER, not a growing table: archived rows
+-- are DELETEd, and their dead space must be reclaimed and REUSED by new inserts
+-- fast enough that the table plateaus near its high-water mark instead of
+-- creeping past the 500 MB limit (a DELETE never returns pages to the OS; it
+-- only makes them reusable by this same table). The payload bytes live in the
+-- TOAST side table, so that is where the churn is and where the scale factor
+-- has to be lowered — the default 0.2 would let a fifth of the table turn to
+-- bloat before a vacuum. Harmless on Pro; it just vacuums a little more often.
+alter table public.segments set (autovacuum_vacuum_scale_factor = 0.05);
+alter table public.segments set (toast.autovacuum_vacuum_scale_factor = 0.05);
+
 -- ---------------------------------------------------------------------------
 -- session_metrics
 -- ---------------------------------------------------------------------------
@@ -701,6 +912,48 @@ create table if not exists public.session_metrics (
   mean_dwell_ms double precision,
   on_target_ratio double precision,
   metrics jsonb
+);
+
+-- ---------------------------------------------------------------------------
+-- archive_manifest
+-- ---------------------------------------------------------------------------
+-- The index of the offline archive (see STORAGE.md and model/DESIGN.md). On
+-- Free tier, segments is a rolling staging buffer: an offline job writes each
+-- aged session's segments to Parquet (local drive + Supabase Storage), records
+-- a row HERE, verifies it, then DELETEs those segments. This table is PERMANENT
+-- and tiny — it outlives the pruning and is what lets the pipeline plan a pull
+-- without reading the blobs: one row per archived session, with the checksum
+-- that gated the delete.
+--
+-- It stores raw_subject_id, NEVER a resolved label. kind/cohort/merged_into are
+-- joined LIVE from subjects at train time, so retroactive relabelling still
+-- works after a session is archived (label a contributor today, every archived
+-- session of theirs reclassifies). Freezing is_human here would destroy that.
+--
+-- Service-key only: RLS on, zero client policies. The client never reads or
+-- writes it, exactly like the archive job's Storage bucket.
+create table if not exists public.archive_manifest (
+  session_id        uuid primary key references public.sessions(id) on delete cascade,
+  raw_subject_id    uuid not null references public.subjects(subject_id),
+  routine           text not null,
+  difficulty        text not null,
+  sampling_version  int  not null,
+  segment_count     int  not null,
+  byte_size         bigint not null,
+  -- Where the Parquet lives. storage_path is the Supabase Storage object key
+  -- (durable copy); local_path is the working copy on the operator's drive and
+  -- is nullable because it is machine-specific.
+  storage_path      text not null,
+  local_path        text,
+  -- sha256 over the sorted (session_id, segment_index) pairs, computed from the
+  -- written Parquet and asserted equal to the database before any DELETE. The
+  -- hard gate that makes "archive then prune" safe for unregenerable data.
+  content_sha256    text not null,
+  archived_at       timestamptz not null default now(),
+  -- Set when the staging rows are actually deleted. A manifest row with
+  -- pruned_at set whose session again has live segments is a late outbox replay
+  -- (IndexedDB can resurface days later) — re-archive, re-verify, re-prune.
+  pruned_at         timestamptz
 );
 
 -- ---------------------------------------------------------------------------
@@ -734,6 +987,15 @@ create index if not exists subjects_kind_idx
 -- listing everything merged into a survivor.
 create index if not exists subjects_merged_into_idx
   on public.subjects (merged_into);
+-- Incremental pulls ("every segment since the last fetch") and the archive job's
+-- age selection both need to range-scan created_at. BRIN, not btree, precisely
+-- because the table is append-only: created_at is perfectly correlated with
+-- physical row order, which is the one case BRIN is built for. It costs a few kB
+-- (a btree would be hundreds of MB) and, unlike a btree, adds no hot right-edge
+-- leaf page for every concurrent writer to contend on — the same contention that
+-- got segments_outcome_idx dropped above.
+create index if not exists segments_created_at_brin
+  on public.segments using brin (created_at);
 
 -- ---------------------------------------------------------------------------
 -- Row level security
@@ -750,6 +1012,10 @@ alter table public.profiles        enable row level security;
 alter table public.sessions        enable row level security;
 alter table public.segments        enable row level security;
 alter table public.session_metrics enable row level security;
+-- archive_manifest gets RLS on and NO policy of any kind: it is written and read
+-- only with the service key by the offline archive job. RLS-on-no-policy denies
+-- the client everything, which is the whole intent.
+alter table public.archive_manifest enable row level security;
 
 -- The v1 `telemetry_logs_v1` table used to be sealed here (RLS on, all grants
 -- revoked from anon and authenticated). It has been dropped, so there is
@@ -788,6 +1054,11 @@ create policy "sessions insert own"
   on public.sessions for insert to authenticated
   with check (
     subject_id = (select public.current_subject_id())
+    -- Consent is a server-side precondition for writing biometric data, not only
+    -- a client gate (canPlay()/applyStartGate()). Existence, not version match —
+    -- see current_consent_version(). Scalar-subquery form for the InitPlan reason
+    -- the other policies document.
+    and (select public.current_consent_version()) is not null
     and ended_at is null
     and poll_hz is null
     and bot_mode is null
@@ -797,6 +1068,29 @@ drop policy if exists "sessions select own" on public.sessions;
 create policy "sessions select own"
   on public.sessions for select to authenticated
   using (subject_id = (select public.current_subject_id()));
+
+-- Column-level insert grant. RLS gates which ROWS you may insert, never which
+-- COLUMNS — the policy above passes for any value of any column. So the fields
+-- documented as SERVICE-WRITTEN (started_at, ended_at, poll_hz, bot_mode) were
+-- forgeable despite their comments. Revoking table-level insert and granting it
+-- per column is what actually confines the client, exactly as the profiles
+-- UPDATE grant does. `id` IS granted: the client mints the session uuid so a
+-- segment can be enqueued before the row's insert resolves (see supabase.js); a
+-- collision merely raises 23505 and leaks nothing.
+--
+-- HAZARD — read before adding any client-written session column: a column the
+-- client sends but is NOT granted here fails the whole insert with 42501, which
+-- outbox.js classifies as PERMANENT and drops. Add the column to BOTH the
+-- payload (telemetry.js) and this grant, or every session silently vanishes.
+-- Supabase grants insert to anon by default too, but anon has no insert policy,
+-- so its inserts fail at RLS regardless; it is left untouched here.
+revoke insert on public.sessions from authenticated;
+grant insert (
+  id, subject_id, routine, difficulty, routine_config, planned_duration_ms,
+  dpi, sens, cm_per_360, fov_deg, refresh_hz,
+  device_fingerprint, user_agent, platform, screen_width, screen_height,
+  device_pixel_ratio, app_version, sampling_version
+) on public.sessions to authenticated;
 
 -- segments: insert into your own session only. Deliberately NO select policy —
 -- trajectory and input_events are the raw material of the biometric template,
@@ -812,6 +1106,19 @@ create policy "segments insert own"
         and s.subject_id = (select public.current_subject_id())
     )
   );
+
+-- Column-level insert grant, same reasoning as sessions above. Excludes `id`
+-- (random uuid default) and `created_at` (now() default), which the client must
+-- never set — created_at in particular is the ordering the archive job and
+-- incremental pulls depend on. The same 42501-drops-everything HAZARD applies:
+-- a new client-written segment column must be added to this grant too.
+revoke insert on public.segments from authenticated;
+grant insert (
+  session_id, segment_index, started_at_ms, outcome, target_distance,
+  time_to_click_ms, dwell_ms, click_offset_x, click_offset_y,
+  target_count, targets, engaged_index, trajectory, input_events,
+  board_trajectory, frame_count, event_count, duration_ms
+) on public.segments to authenticated;
 
 -- session_metrics: read your own. Writes are service-key only.
 drop policy if exists "session metrics select own" on public.session_metrics;
@@ -861,6 +1168,23 @@ create policy "session metrics select own"
 -- is_human expression and inserts the provenance columns mid-list, which
 -- replace rejects. The view holds no data, so dropping it is free.
 
+-- CONSUMING THIS VIEW (notes for fetch_telemetry.py):
+--  * Filter the label with `where subject_kind in ('human','synthetic')`, NOT
+--    `where is_human is not null`. is_human is a CASE expression, so the latter
+--    is non-sargable: the planner falls back to 0.5 default selectivity and
+--    full-scans segments plus its entire TOAST table. subject_kind is a plain
+--    column and the filter is sargable.
+--  * Page with KEYSET, never LIMIT/OFFSET. The view has no intrinsic order, so
+--    OFFSET both skips and duplicates rows (and is O(n^2)). Order by
+--    (segment_created_at, segment_id) and page on the last-seen pair.
+--  * Incremental pulls ("since last watermark") must LAG, e.g.
+--    `segment_created_at < now() - interval '1 hour'`: a row can commit after
+--    your snapshot with an earlier created_at and be missed otherwise.
+--  * AFTER ARCHIVAL this view is no longer the whole training set — it is only
+--    the UN-ARCHIVED TAIL still in segments. The full dataset is
+--    archive_manifest (joined to subjects for the live label) PLUS this tail.
+--    See STORAGE.md and model/DESIGN.md.
+
 drop view if exists public.v_training_segments;
 
 create view public.v_training_segments
@@ -885,6 +1209,8 @@ select
   sub.kind_source                   as subject_kind_source,
   sub.cohort                        as subject_cohort,
   sub.labeled_at                    as subject_labeled_at,
+  -- So a training set is auditably consented without a second query.
+  sub.consent_version               as subject_consent_version,
   s.routine,
   s.difficulty,
   s.planned_duration_ms,
@@ -899,7 +1225,10 @@ select
   s.app_version,
   s.sampling_version,
   s.started_at        as session_started_at,
+  s.ended_at          as session_ended_at,
   g.segment_index,
+  -- Insert time. The keyset-pagination and incremental-pull cursor; see header.
+  g.created_at        as segment_created_at,
   g.started_at_ms,
   g.outcome,
   g.target_distance,

@@ -10,8 +10,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `aim-simulator-prd.md` is the specification. v1 (§8's four phases) shipped and is verified
 against §9. The project is now in **v2**: a multi-routine trainer with a home screen,
 player-configurable sensitivity, and a difficulty manager — all marked **(v2)** in the
-PRD's §3. Multiple concurrent targets, moving targets, and menus are **in** scope now;
-the older text saying otherwise has been amended.
+PRD's §3. Moving targets and menus are **in** scope. Multiple *concurrent* targets exist in
+code but are **withheld** for the data-collection campaign (see the routines note below and
+`AUDIT-2026-10.md` #10).
+
+The project is now at its **data-collection campaign**: a finite, one-off dataset of ~20 human
+contributors and ~5 bot variants (≈150 sessions), feeding two offline models — a bot detector
+and biometric identification. That finite framing drives the storage model (`STORAGE.md`) and
+the pre-collection hardening recorded in **`AUDIT-2026-10.md`**. The schema changes from that
+pass are in `schema.sql` but **not yet applied to the live database** (`LABELING.md` STATUS).
 
 Alongside the game, an **offline Python pipeline is planned to live in `model/`**: it will
 pull telemetry back out of Supabase and train a human-vs-bot classifier. It is a separate
@@ -33,12 +40,15 @@ Adding a dependency or a framework *there* is a spec violation, not an improveme
 ## Implemented so far
 
 **Game (`src/`) — complete for v2's current scope:**
-- **Five routines shipped**: precision flick, static flicking (gridshot), dynamic reflex
-  (spidershot), reactive strafing, and target switching. `src/routines/index.js` is both
-  the catalogue and the factory — it gates each tile with `available`, and `isAvailable`
-  also requires a registered factory, so a new routine needs both. `src/difficulty.js`
-  holds every per-routine parameter (all five routines × easy/medium/hard).
-- Timed runs (1/5/10/15 min) with a home screen, pause/resume via pointer lock, and a
+- **Three routines ship; two are withheld (code kept).** The campaign menu is precision flick,
+  dynamic reflex (spidershot), and reactive strafing — all single-target, so each routine's
+  `aimTarget()` is correct by construction. Static flicking (gridshot) and target switching are
+  multi-target and **withheld**: their `aimTarget()` returns an arbitrary `pool.active[0]`, which
+  would write a misleading `tx/ty/tz` and `engaged_index` into an unregenerable dataset. They live
+  in `RETIRED_ROUTINES` in `src/routines/index.js` — factories, files and `difficulty.js` entries
+  all retained — and `ROUTINES` (which `isAvailable()` consults) holds only the three. Reviving one
+  is moving its entry back into `ROUTINES`. `routineById()` still resolves both so old names render.
+- Timed runs (**5/10/15 min**, default 5) with a home screen, pause/resume via pointer lock, and a
   results screen. See "Architecture" below for the full session/segment model.
 - Full v2 telemetry pipeline: session + segment tables, columnar per-frame trajectories,
   a durable IndexedDB-backed outbox with retry/backoff, and DPI-independent sensitivity
@@ -94,7 +104,7 @@ drill. `game.js` branches on `kind` for both scoring and telemetry (see the segm
 below).
 
 **A timed run is the session boundary; pointer lock only pauses it.** The player picks
-1, 5, 10 or 15 minutes on the home screen (`SESSION_DURATIONS_MIN`) and
+5, 10 or 15 minutes on the home screen (`SESSION_DURATIONS_MIN`, default 5) and
 `sessions.planned_duration_ms` records that choice. `main.js` holds a three-state machine
 (`idle | running | paused`) because the `lock`/`unlock` events alone can no longer say
 whether a lock starts a run or resumes one: lock either calls `game.start()` (new session
@@ -296,7 +306,14 @@ All of it is current; read it rather than re-deriving:
   (403 / RLS, the `42501` upsert-header trap). It is the origin story for the outbox rules
   in "Supabase" below; read it before changing delivery.
 - **`aim-simulator-prd.md`** — the spec. §3 carries the `(v2)` markers.
-- **`model/DESIGN.md`** — the unbuilt pipeline's design.
+- **`model/DESIGN.md`** — the unbuilt pipeline's design, including the archive job and the
+  bot-detector / biometric-identification training protocols.
+- **`AUDIT-2026-10.md`** — the pre-collection hardening audit: every problem found before data
+  collection, its fix, and the files changed (plus accepted risks and known-remaining items).
+- **`STORAGE.md`** — the storage model: the `sampling_version` 4 shrink and the Free-tier
+  archive-then-prune design with its operating rules.
+- **`queries/campaign.sql`** — read-only operator queries for the campaign (per-subject progress,
+  database size against the archive trigger, ingest-health checks).
 
 Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
 
@@ -335,8 +352,13 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   It is stamped on every `sessions` row and is the only thing that stops a training pull
   silently mixing rows produced by two different samplers. `APP_VERSION` comes free from
   `package.json` via `vite.config.js`; `SAMPLING_VERSION` is hand-maintained in
-  `constants.js`, so it is the one that gets forgotten. It is **3**: at 3 the frame clock
-  excludes paused time, so `t` and `started_at_ms` are active-play milliseconds.
+  `constants.js`, so it is the one that gets forgotten. It is **4**: at 3 the frame clock
+  excludes paused time (`t`/`started_at_ms` are active-play ms); 4 adds the storage-shrink
+  encoding — `input_events` delta-encoded as `{t0, dt, dx, dy}` in integer tenths of a
+  millisecond, and per-frame `tx/ty/tz` omitted for static-target routines (flick, spidershot),
+  where the engaged target is stationary and its position already lives in the `targets` snapshot.
+  A `v3` row is a different shape and must be excluded from a v4 pull, never decoded with the v4
+  reader. Decoding lives only in the offline archive job (`STORAGE.md`, `model/DESIGN.md`).
 - **A click in a tracking routine writes no row.** `trackingShot()` flashes the crosshair
   and moves the HUD's `hits`/`attempts`, but does not close a segment, does not touch
   `clicks`, and does not call `flushSegment` — tracking segments close only on the
@@ -372,9 +394,25 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   on pages whose CSS it does not control and a class-based toggle loses to any rule giving
   a block its own `display` (the `.x.hidden` trap above).
 - **`subjects.kind` is default-deny; never write a model prediction back into it.** See
-  "Label integrity" below. This is the newest invariant in the codebase and the easiest to
-  violate by accident once the pipeline exists — a retrain that consumes its predecessor's
-  guesses as ground truth amplifies its own errors, silently, across every future retrain.
+  "Label integrity" below. A retrain that consumes its predecessor's guesses as ground truth
+  amplifies its own errors, silently, across every future retrain.
+- **Client-written columns are confined by a column-level `grant insert`, not just by RLS.**
+  `schema.sql` revokes table-level insert on `sessions`/`segments` and grants only the specific
+  columns the client legitimately writes (RLS gates rows, never columns). **A new client-written
+  column must be added to BOTH the payload (`telemetry.js`) and the grant.** Send a column that
+  is not granted and the whole insert fails with `42501`, which `outbox.js` classifies as
+  permanent and **drops every row** — silent total loss. This is why `poll_hz`/`started_at`/
+  `ended_at`/`bot_mode` (service-written) are absent from the payload, and why `sessions.id` and
+  `segments` exclude `id`/`created_at`.
+- **`merged_into` is depth-1 in both directions — enforced in the schema.** The training view
+  collapses duplicates with a one-level `coalesce(merged_into, subject_id)`, so a chain `A→B→C`
+  would leak one person onto two identities (fatal for biometric identification, inflating for
+  the bot detector). A self-reference CHECK and the `enforce_merge_depth` trigger forbid merging
+  into an already-merged subject or merging a subject others already point at. When merging
+  duplicates, point every one of a person's accounts directly at the single survivor.
+- **Consent is a server-side insert precondition, not only a client gate.** The `sessions` insert
+  policy requires `current_consent_version() is not null`, so `canPlay()`/`applyStartGate()` are
+  now the UX layer over a database rule, not the only check.
 
 ## Supabase
 
@@ -385,44 +423,54 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   removed), or Google OAuth. `ensureAuth()` resolves the caller's `subject_id` from
   `profiles` only when a session exists, and returns `null` otherwise — so an
   unauthenticated session writes nothing at all, which is the guarantee that no
-  anonymous rows reach the table. It writes a `sessions` row (`insertSession`, awaited for
-  its id) and hands each closed segment to the **durable outbox** (`insertSegment`), never
-  a bare fire-and-forget insert. `is_human` is gone from the client — the label is
-  `subjects.kind`, set server-side, and it is **default-deny**: a new signup is
-  `'unknown'`, never `'human'`.
+  anonymous rows reach the table. The session **id is minted on the client** (`game.js`), so
+  `insertSession` and `insertSegment` both hand rows to **durable, IndexedDB-backed outboxes**
+  (one per table) rather than awaiting an id — a failed session insert no longer discards the
+  run. `is_human` is gone from the client — the label is `subjects.kind`, set server-side, and it
+  is **default-deny**: a new signup is `'unknown'`, never `'human'`.
 - **A persisted session is not proof the account still exists.** `supabase-js` restores it
   from `localStorage` and fires `INITIAL_SESSION` with no server round-trip, so a deleted or
   revoked account still renders as signed in while silently writing nothing (`ensureAuth()`
-  can resolve no `profiles` row for it). `validateSession()`, called once at boot from
-  `main.js` before `initTelemetryOutbox()` (and from `landing.js` too), forces that
-  round-trip with `auth.getUser()` and signs out locally (`{ scope: 'local' }`) only on a
+  can resolve no `profiles` row for it). `validateSession()`, awaited at boot in `main.js`
+  **before** `initTelemetryOutbox()` runs (chained with `.finally`), and also called from
+  `landing.js`, forces that round-trip with `auth.getUser()` and signs out locally
+  (`{ scope: 'local' }`) only on a
   definitive `401`/`403` — a network failure or a `5xx` must never be treated the same way,
   on the identical permanent-vs-transient reasoning the outbox applies to delivery failures
   below.
-- **Segment delivery goes through `src/outbox.js`**: batched, retried with backoff, and
-  mirrored to **IndexedDB** (async — never localStorage, whose sync write would hitch the
-  render loop the timing features are measured from). Delivery is a **plain INSERT, never an
-  upsert** — PostgREST enters its upsert path on the `Prefer: resolution=...` header alone
-  (the `on_conflict` query param is inert without it), and that path is refused with `42501`
-  on `segments`, which grants neither SELECT nor UPDATE by design. Both `ignore-duplicates`
-  and `merge-duplicates` fail; the identical row inserts fine without the header. Idempotency
-  comes from the unique `(session_id, segment_index)` instead: a re-sent row raises `23505`,
-  which the outbox settles as "already delivered", so a partly-landed batch is still retried
-  whole. Failures are classified by SQLSTATE — classes `22`/`23`/`42` are permanent, so the
-  batch is re-sent one row at a time and only the genuinely undeliverable rows are dropped;
-  everything else keeps its backoff-and-retry. Without that split, one row whose session
-  belongs to a subject that is no longer signed in blocks every row behind it forever.
-  `flushTelemetryKeepalive()` sends the last batch on `pagehide` with a keepalive fetch;
-  anything unsent replays from IndexedDB on the next load (`initTelemetryOutbox`).
-  **`SEGMENT_DELIVERY_INCIDENT.md` is the full postmortem — read it before touching this.**
+- **Delivery goes through `src/outbox.js`** — **two outbox instances, one per table** (sessions
+  and segments), each with its own IndexedDB object store in the one `aim-trainer-outbox` database
+  (version 2; the store name is load-bearing — renaming it orphans queued telemetry). Batched,
+  retried with backoff, mirrored to **IndexedDB** (async — never localStorage, whose sync write
+  would hitch the render loop). Delivery is a **plain INSERT, never an upsert** — PostgREST enters
+  its upsert path on the `Prefer: resolution=...` header alone (the `on_conflict` query param is
+  inert without it), and that path is refused with `42501` on `segments`, which grants neither
+  SELECT nor UPDATE by design. Idempotency comes from the unique key instead (segments:
+  `(session_id, segment_index)`; sessions: `id`): a re-sent row raises `23505`, settled as
+  "already delivered". Failures are classified by SQLSTATE — classes `22`/`23`/`42` are permanent
+  and get isolated row-by-row so only genuinely bad rows drop — **except `23503`
+  (`foreign_key_violation`), which is transient**: a segment can reach the DB before its session
+  row (separate outboxes), and that is a wait, not a failure. Each queued row also carries its
+  **owner `user_id`** in the IndexedDB envelope; a row whose owner is not the signed-in account is
+  **held, not attempted** (so a shared machine never ships one participant's rows under another's
+  login and drops them on RLS). `initTelemetryOutbox` replays **sessions before segments**.
+  `flushTelemetryKeepalive()` sends a **bounded** last batch on `pagehide` (≤~60 kB — the browser
+  caps keepalive bodies at ~64 kB, and two segments already exceed that, so it fills one request
+  oldest-first and the rest replay next load). **`SEGMENT_DELIVERY_INCIDENT.md` is the full
+  postmortem — read it before touching this.**
 - `src/telemetry.js` builds two payloads (`buildSessionPayload`, `buildSegmentPayload`)
   and stores streams **columnar** (parallel arrays keyed by field name): `trajectory`
-  (per rendered frame), `input_events` (`{t, dx, dy}`, one per raw pointer sample), and
-  `board_trajectory` (the non-engaged targets' per-frame paths, only for a multi-target
-  moving routine). Each segment also carries `duration_ms` (lifted from the trajectory tail).
-- `src/game.js` opens the session on `start()` and holds `sessionIdPromise`; each
-  `flushSegment` assembles its row synchronously and hands the promise to `insertSegment`,
-  so the network never blocks the loop. It stamps `segment_index`, `started_at_ms`
+  (per rendered frame; `tx/ty/tz` omitted for static-target routines — `sampling_version` 4),
+  `input_events` (**delta-encoded `{t0, dt, dx, dy}`** in tenths of a millisecond, one entry per
+  raw pointer sample), and `board_trajectory` (the non-engaged targets' per-frame paths, only for
+  a multi-target moving routine). Each segment also carries `duration_ms` (lifted from the
+  trajectory tail). `buildSessionPayload` must **not** emit `poll_hz` (service-written, not in the
+  insert grant — see the column-grant invariant above).
+- `src/game.js` mints the session id in `start()` (`newSessionId()` → `crypto.randomUUID` with a
+  fallback) and holds it in `currentSessionId`; each `flushSegment` assembles its row and calls
+  `insertSegment(currentSessionId, …)` **synchronously** (no promise to await), so the network
+  never blocks the loop and a segment is durable the instant it closes. It stamps `segment_index`,
+  `started_at_ms`
   (`attemptStart − sessionStartMs`, on the play clock, so paused time is excluded), and
   `engaged_index` — captured at segment start as
   `routine.targets.indexOf(aimTarget())`, no longer hardcoded to 0. `onPointerMove`
@@ -571,9 +619,11 @@ bundle entirely.
 ## Label integrity
 
 The default-deny fix to `subjects.kind` is a schema change plus a manual operational
-runbook. The schema half is applied and validated against the live database; the one
+runbook. The default-deny half is applied and validated against the live database; the one
 remaining step is labelling bot accounts and trusted human contributors, which cannot
-start before Phase 6 recruitment.
+start before Phase 6 recruitment. **Note:** the later hardening (consent enforcement, merge
+guards, column grants, etc. — `AUDIT-2026-10.md`) is in `schema.sql` but **not yet applied to
+live** — re-paste `schema.sql` as one buffer and re-verify (`LABELING.md` STATUS addendum).
 
 **`LABELING.md` is the authority** — its STATUS block is the single place that answers "is
 the label fix actually live", and §5 has the exact statements. Read it before running any
@@ -581,18 +631,23 @@ remaining step, do not improvise them, and keep that STATUS block current by han
 
 ## Known defects — not yet fixed
 
-- **The database is not sized for multiple concurrent users.** One 10-minute session
-  writes **~9.6 MB** (`input_events` is ~55% of it), so 50 users × 3 sessions/week is
-  ~6.2 GB/month against a 500 MB free tier and an 8 GB Pro tier, with nothing deleting,
-  partitioning or archiving anything. A failed `sessions` insert also discards that whole
-  session's segments *before* they reach the outbox (`supabase.js:435-438`, `:449-451`),
-  and every failure path reports only to the user's own `console.warn`, so the loss is
-  invisible. **`src/TODO.md` is the live list** — it holds these, the deferred orphan
-  repair and BRIN index, and the smaller findings, each with the SQL or the file:line.
-- **`model/` does not exist as code.** Not a defect in anything built — a reminder that
-  the pipeline is a design (`model/DESIGN.md`), not a working program, and should not be
-  cited as if it runs. `schema.sql`'s comment above `v_training_segments` names
-  `fetch_telemetry.py` as its consumer; that is a forward reference, not evidence.
+Most of the earlier multi-user audit is now applied (**`AUDIT-2026-10.md`** is the record). What
+remains:
+
+- **Storage is managed by archive-and-prune, and the archive job does not exist yet.** The
+  encoding shrink (`sampling_version` 4) plus 5-minute sessions put a 5-min session at ~2.6 MB, and
+  the finite campaign (~150 sessions ≈ ~400 MB) fits Free **only if** `segments` is archived to
+  Parquet and pruned before it passes ~150 MB (`STORAGE.md`). That archive job is the first
+  unbuilt piece of `model/` (`src/TODO.md` §1). Watch `segments` size with
+  `queries/campaign.sql` §3 from week one.
+- **Ingest loss is still only visible client-side** (`console.warn`). `queries/campaign.sql` §4
+  answers "is data landing" from the database; a `client_events` table is deferred (`src/TODO.md`
+  §2). *(The old "failed `sessions` insert discards the run" defect is fixed — see D.1 /
+  `AUDIT-2026-10.md` #4.)*
+- **`model/` does not exist as code.** A reminder that the pipeline (and now the archive job) is a
+  design (`model/DESIGN.md`, `STORAGE.md`), not a working program; do not cite a `model/src/*.py`
+  file as if it runs. `schema.sql`'s comment above `v_training_segments` names `fetch_telemetry.py`
+  as its consumer; that is a forward reference.
 
 **Deliberately not defects** (recorded so they aren't "discovered" again): no predictions
 table exists yet — correct, it should only be built once a model exists, and it must never
@@ -620,8 +675,12 @@ buffer isolation, outbox delivery). To do that:
   `.../supabase.js` to a capturing stub; then drive `game.js` with a stub `document` that
   records handlers by type. This is how the segment-payload shape (`engaged_index`,
   `board_trajectory`, `duration_ms`) is validated headlessly.
-- `src/outbox.js` is pure and injectable: pass a `send`/`store` stub to check batching,
-  idempotent dedupe, retry-on-failure, keepalive, and IndexedDB replay with no browser.
+- `src/outbox.js` is pure and injectable: pass `send`/`store`/`currentOwner` stubs to check
+  batching, idempotent dedupe (`23505` settles), retry-on-failure, the **`23503` transient** path,
+  **owner-scoped skip** (a foreign-owner row is held, not dropped), the **bounded keepalive**, and
+  IndexedDB replay — all with no browser. The `input_events` delta codec round-trips through
+  `buildSegmentPayload` + an integer `cumsum`, and a segment survives a failed `insertSession`
+  (the D.1 property) when `game.js` is driven against a stubbed failing session insert.
 - `settings.js` needs `globalThis.window.localStorage` stubbed; a `Map` is enough.
   `createControls` needs a fake element carrying `ownerDocument` with add/removeEventListener.
 - Sensitivity has a known-good reference: Valorant sens `0.4` @ `800` DPI is `40.8 cm/360`.

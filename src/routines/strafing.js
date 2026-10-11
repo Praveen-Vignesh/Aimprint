@@ -52,6 +52,10 @@ export function createStrafingRoutine({ scene, camera, config }) {
     // Tracking: the drill is staying on a live target, so telemetry is sampled
     // in fixed time windows rather than per click.
     kind: 'tracking',
+    // The target moves, so its per-frame tx/ty/tz must be stored (sampling_version
+    // 4 omits those columns for static routines, where the position is constant
+    // and already in the `targets` snapshot).
+    movesTargets: true,
     targets: pool.active,
 
     start(now) {

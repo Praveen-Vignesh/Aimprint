@@ -37,6 +37,8 @@ export function createSwitchingRoutine({ scene, camera, config }) {
 
   return {
     kind: 'destructible',
+    // Targets move, so per-frame tx/ty/tz is kept (see sampling_version 4).
+    movesTargets: true,
     targets: pool.active,
     // Several targets move at once, so the non-engaged targets' paths must be
     // recorded per frame (board_trajectory) — the drill is target selection, and

@@ -43,9 +43,11 @@ VITE_SUPABASE_ANON_KEY=sb_publishable_your-key
 The URL is under **Project Settings → Data API**, the key under **Project Settings
 → API Keys**. Use the bare origin — `https://<project-ref>.supabase.co`, with no
 `/rest/v1` path and no trailing slash; the client appends the path itself. Use the publishable key (`sb_publishable_...`), or the legacy anon
-key on older projects — both resolve to the `anon` role that `schema.sql` grants
-insert to. Never use the secret or `service_role` key: `VITE_` variables are
-inlined into the JS bundle and would be readable by anyone.
+key on older projects — both carry the `anon` role when signed out and the
+`authenticated` role once a user signs in, and `schema.sql` grants insert only to
+`authenticated` (so a signed-out visitor writes nothing). Never use the secret or
+`service_role` key: `VITE_` variables are inlined into the JS bundle and would be
+readable by anyone.
 
 `.env.local` is gitignored. Without it the trainer still runs — it logs one
 warning and drops telemetry instead of persisting it.
@@ -57,7 +59,7 @@ npm run dev
 ```
 
 Open http://localhost:5173/, pick a routine, a difficulty and a session length
-(1, 5, 10 or 15 minutes), then press Start and left-click to shoot. `Esc` releases
+(5, 10 or 15 minutes), then press Start and left-click to shoot. `Esc` releases
 the pointer and **pauses the countdown**; resuming continues the same run, so a
 run spans as many pointer locks as you like. The run ends when its timer expires
 or you pick "End run", and a results screen reports how much of it you played —
@@ -88,12 +90,15 @@ client can write.
 One row in `segments` is one **segment** of play — a shape that fits every
 routine. A segment closes with an `outcome`:
 
-- `hit` / `miss` — a click in a destructible routine (flick, gridshot,
-  spidershot, switching).
+- `hit` / `miss` — a click in a destructible routine (flick, spidershot).
 - `timeout` — a spidershot target expired before it was clicked; the failed
   attempt is kept, not discarded.
 - `track` — a tracking routine (strafing) has no click, so it is logged in fixed
   ~1-second windows, and once more when the run is paused or ends.
+
+(Two further routines — static flicking and target switching — exist in the
+codebase but are withheld from the menu for this campaign; see
+[AUDIT-2026-10.md](AUDIT-2026-10.md) #10.)
 
 Every row carries the session id, the `routine` and `difficulty` it came from,
 the `outcome`, the number of targets on screen and their layout at segment start
@@ -110,9 +115,16 @@ sensitivity); `yaw`/`pitch` are the camera's resulting angles in radians, which
 are DPI-independent and the better signal for aim analysis or bot detection;
 `tx`/`ty`/`tz` are the engaged target's world position that frame — so tracking
 error is recoverable even while the target moves; and `on` is whether the
-crosshair was over a target that frame. Delivery goes through a durable outbox
-(`src/outbox.js`): batched, retried with backoff, mirrored to IndexedDB, and
-replayed on the next page load, so a network blip never loses recorded play.
+crosshair was over a target that frame. For static-target routines (flick,
+spidershot) the `tx/ty/tz` columns are omitted — the target does not move, so its
+position comes from the per-segment `targets` snapshot instead. The raw
+`input_events` stream is stored delta-encoded (`{t0, dt, dx, dy}`, timestamps in
+tenths of a millisecond). Both are `sampling_version` 4.
+
+Delivery goes through a durable outbox (`src/outbox.js`): batched, retried with
+backoff, mirrored to IndexedDB, replayed on the next page load, and scoped to the
+signed-in account so a shared machine never ships one participant's rows under
+another's login — so a network blip never loses recorded play.
 
 ## Notes
 

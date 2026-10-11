@@ -140,10 +140,15 @@ home.setScreen('home');
 // server, so a deleted or revoked account would otherwise render as signed in
 // while recording nothing. This is the round-trip that corrects it; the sign-out
 // it may trigger flows back through onAuthChange above and re-renders the panel.
-validateSession();
-
-// Replay any telemetry a previous page load could not deliver.
-initTelemetryOutbox();
+//
+// The outbox replay is chained AFTER validation settles, not fired alongside it:
+// if validation signs out a stale account, the replayed rows are owner-scoped to
+// that account and are correctly held rather than thrown at the database under a
+// signed-out identity. .finally so replay still runs if validation errors.
+validateSession().finally(() => {
+  // Replay any telemetry a previous page load could not deliver.
+  initTelemetryOutbox();
+});
 
 // Rolling refresh-rate estimate, sampled off the render loop (which runs on the
 // home screen too), so a run already has a value the moment it starts. The
@@ -187,7 +192,8 @@ function sessionInfo() {
     cmPer360: sensitivity.cm360,
     fovDeg: CAMERA_FOV,
     refreshHz: fpsEstimate > 0 ? Math.round(fpsEstimate) : null,
-    pollHz: null,
+    // poll_hz is not sent — it is service-written (derived offline) and the
+    // schema's column grant excludes it; see buildSessionPayload.
     deviceFingerprint: deviceFingerprint(),
     userAgent: navigator.userAgent,
     platform: navigator.platform,

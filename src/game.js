@@ -27,6 +27,23 @@ function round3(value) {
   return Math.round(value * 1e3) / 1e3;
 }
 
+// A client-minted session uuid. The session id is generated HERE, at start(),
+// rather than returned by the insert, so a segment can be enqueued the instant
+// it closes (it already knows the id) and a failed session insert cannot discard
+// the run. crypto.randomUUID() in any modern browser or Node; the fallback keeps
+// the headless harness and any old runtime working. A collision is astronomically
+// unlikely and would merely raise 23505, which the outbox settles.
+function newSessionId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 // Hosts whichever routine is active: it owns the session, the raycast, the HUD
 // counters and telemetry, and asks the routine what to do with a hit or a miss.
 //
@@ -40,10 +57,11 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
 
   let routine = null;
   let running = false;
-  // The DB session id arrives asynchronously; every segment awaits this promise
-  // so it can be assembled synchronously in the game loop while the id is still
-  // in flight. Resolves to null when persistence is unavailable.
-  let sessionIdPromise = Promise.resolve(null);
+  // The DB session id, minted on the client in start() (see newSessionId). Every
+  // segment carries it directly, so a segment is enqueued synchronously the
+  // moment it closes — no promise to await, and no dependency on the session
+  // insert having resolved. null between runs.
+  let currentSessionId = null;
   let sessionStartMs = 0;
   // Resets ONLY in start(), which also mints a fresh session id. Never reset it
   // on resume: a re-used index collides with a pre-pause row on the unique
@@ -204,7 +222,7 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
     } = fields;
 
     insertSegment(
-      sessionIdPromise,
+      currentSessionId,
       buildSegmentPayload({
         segmentIndex: segmentIndex++,
         startedAtMs: Math.round(attemptStart - sessionStartMs),
@@ -218,7 +236,10 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
         engagedIndex: engagedIndexAtStart,
         frames,
         inputs,
-        boardFrames
+        boardFrames,
+        // Static-target routines omit per-frame tx/ty/tz (sampling_version 4);
+        // only strafing/switching declare movesTargets.
+        movesTargets: routine.movesTargets === true
       })
     );
   }
@@ -404,12 +425,16 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
       sessionStartMs = now;
       segmentIndex = 0;
 
-      // Open the session row. Its id is awaited by every segment insert, so the
-      // network round-trip never blocks the game loop. options.session carries
-      // the hardware block (dpi/sens/cm360, fov, refresh, device) from main.js.
-      // It is NOT reassigned on pause/resume: one run is one session row.
-      sessionIdPromise = insertSession(
+      // Mint the session id here and open the session row with it. insertSession
+      // is fire-and-forget (durable: it queues to its own outbox and retries), so
+      // nothing blocks the game loop and a transient failure no longer loses the
+      // run. options.session carries the hardware block (dpi/sens/cm360, fov,
+      // refresh, device) from main.js. The id is NOT regenerated on pause/resume:
+      // one run is one session row.
+      currentSessionId = newSessionId();
+      insertSession(
         buildSessionPayload({
+          id: currentSessionId,
           routine: routineId,
           difficulty,
           routineConfig: config,
@@ -467,7 +492,7 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
       pausedTotalMs += performance.now() - pauseStartedAt;
       running = true;
       document.addEventListener('pointermove', onPointerMove);
-      // segmentIndex and sessionIdPromise are deliberately untouched.
+      // segmentIndex and currentSessionId are deliberately untouched.
       beginAttempt(play(performance.now()));
     },
 

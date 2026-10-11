@@ -36,6 +36,23 @@
 > `kind='human'`. Both were stale; the queries above resolved it — that claim
 > predated the migration and was never re-checked. If you restore from a backup
 > predating 2026-09-17, re-run the §5.2 pre-flight before trusting any of this.*
+>
+> ### Addendum 2026-10-10 — pre-collection hardening (NOT yet applied to live)
+> The pre-collection pass (`AUDIT-2026-10.md`) added more to `schema.sql`: a
+> server-side **consent precondition** on the `sessions` insert policy,
+> `merged_into` **depth-1 guards** (a self-reference CHECK plus the
+> `enforce_merge_depth` trigger), column-level insert grants, five segment shape
+> CHECKs, `search_path = ''` on the SECURITY DEFINER functions, the orphan-repair
+> block, a BRIN index, and the `archive_manifest` table. **These are in the file
+> but have NOT been applied to the live database.** Paste `schema.sql` as one
+> buffer and re-run §6 to make this STATUS current again. The default-deny label
+> fix itself is unchanged and remains live as verified 2026-09-17.
+>
+> Labelling still works after a session is **archived** (`STORAGE.md`): the
+> archive stores `raw_subject_id`, and `is_human`/`cohort` are joined from
+> `subjects` at train time, so relabelling stays retroactive across the archive
+> boundary. §5.6 (labelling the batches) is still the only outstanding manual
+> step and cannot start before Phase 6 recruitment / bot provisioning.
 
 **What this document is.** Why the human-vs-bot ground-truth label was unsafe,
 what changed, and the runbook for applying it. `schema.sql` is authoritative for
