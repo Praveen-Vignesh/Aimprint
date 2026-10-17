@@ -40,11 +40,15 @@ export function createSwitchingRoutine({ scene, camera, config }) {
     // Targets move, so per-frame tx/ty/tz is kept (see sampling_version 4).
     movesTargets: true,
     targets: pool.active,
-    // Several targets move at once, so the non-engaged targets' paths must be
-    // recorded per frame (board_trajectory) — the drill is target selection, and
-    // "where was the target you switched to" is unrecoverable otherwise. The
-    // single-target and static routines leave this off.
-    tracksBoardTrajectory: true,
+    // NOTE: this routine used to set `tracksBoardTrajectory: true`, which
+    // recorded the non-engaged targets' per-frame paths into a
+    // `segments.board_trajectory` column. That column has been REMOVED from the
+    // schema, since this is the only routine that ever wrote it and it is
+    // withheld from the UI. Reviving this routine for data collection means
+    // re-adding the column, its shape guard, its lz4 line and its insert grant
+    // in schema.sql, plus the sampleBoard/toBoardColumnar plumbing in
+    // telemetry.js — otherwise "which target did they switch to" is
+    // unrecoverable, which is the whole signal this drill exists to measure.
 
     start(now) {
       pool.releaseAll();

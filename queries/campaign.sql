@@ -29,7 +29,6 @@ from public.subjects sub
   left join public.profiles p on p.subject_id = sub.subject_id
   left join auth.users u       on u.id = p.user_id
   left join public.sessions s  on s.subject_id = sub.subject_id
-where sub.merged_into is null         -- canonical identities only
 group by sub.subject_id, u.email, sub.kind, sub.cohort
 order by sub.kind, enough, days desc;
 
@@ -41,7 +40,6 @@ select
   coalesce(cohort, '(none)') as cohort,
   count(*)                   as subjects
 from public.subjects
-where merged_into is null
 group by kind, cohort
 order by kind, cohort;
 

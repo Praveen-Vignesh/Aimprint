@@ -72,8 +72,8 @@ Why this shape and not client-upload-to-Storage:
   having no select policy.
 - **The `23505` idempotency contract is untouched**, along with the outbox, the keepalive flush
   and every RLS policy. Nothing from `SEGMENT_DELIVERY_INCIDENT.md` is rebuilt.
-- **Labels stay live.** The archive stores `raw_subject_id` only; `kind`, `cohort` and the
-  `merged_into` collapse are joined from the permanent `subjects` table at train time. So a
+- **Labels stay live.** The archive stores `raw_subject_id` only; `kind` and `cohort` are
+  joined from the permanent `subjects` table at train time. So a
   contributor labelled *after* their sessions are archived still reclassifies retroactively —
   the property `LABELING.md` depends on.
 

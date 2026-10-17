@@ -152,9 +152,9 @@ tracking and moving-target modes, where the target moves even when the mouse is 
 `camera.quaternion` as a `YXZ` Euler (`.y` yaw, `.x` pitch) — DPI-independent. `tx/ty/tz` are
 the engaged (`aimTarget()`) target's world position that frame; `on` is whether the crosshair
 sat on any live target (`raycastCenter()`), which also stamps `dwellStart` on first contact.
-A multi-target moving routine (`tracksBoardTrajectory` — only `switching` sets it)
-additionally records every live target's position that frame into `board_trajectory`, in
-lockstep so the frame counts match. Angles are rounded to 5 decimals, positions to 3, in
+`tx/ty/tz` are written only when the routine declares `movesTargets` (`strafing`, and the
+withheld `switching`); a static-target routine omits those three columns because the position
+is constant and already in the `targets` snapshot. Angles are rounded to 5 decimals, positions to 3, in
 `telemetry.js`; `input_events` keep sub-millisecond `t`, because at a 1000 Hz poll rate
 whole-ms rounding would collapse distinct samples.
 
@@ -170,7 +170,7 @@ counts against accuracy but not against the average click time (the `clicks` HUD
 **Routines own their targets; `game.js` owns everything else.** Each routine exposes the
 same shape: a live `targets` array to raycast against, `start`/`update`/`stop`,
 `resolveHit`/`resolveMiss`, and `aimTarget()` (the engaged target each telemetry frame
-records; multi-target moving routines also set `tracksBoardTrajectory`). `update()` returns
+records; routines whose target moves also set `movesTargets`). `update()` returns
 `{expired}` using frozen module-level constants, since it runs every frame. A routine is
 built fresh per session, so mode and difficulty changes always take effect on the next
 start — which means `stop()` must dispose its pool or meshes accumulate in the scene.
@@ -402,14 +402,21 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   column must be added to BOTH the payload (`telemetry.js`) and the grant.** Send a column that
   is not granted and the whole insert fails with `42501`, which `outbox.js` classifies as
   permanent and **drops every row** — silent total loss. This is why `poll_hz`/`started_at`/
-  `ended_at`/`bot_mode` (service-written) are absent from the payload, and why `sessions.id` and
+  `ended_at` (service-written) are absent from the payload, and why `sessions.id` and
   `segments` exclude `id`/`created_at`.
-- **`merged_into` is depth-1 in both directions — enforced in the schema.** The training view
-  collapses duplicates with a one-level `coalesce(merged_into, subject_id)`, so a chain `A→B→C`
-  would leak one person onto two identities (fatal for biometric identification, inflating for
-  the bot detector). A self-reference CHECK and the `enforce_merge_depth` trigger forbid merging
-  into an already-merged subject or merging a subject others already point at. When merging
-  duplicates, point every one of a person's accounts directly at the single survivor.
+- **One subject row is one identity — there is no duplicate-merging mechanism.** `merged_into`,
+  its self-reference CHECK, the `enforce_merge_depth` trigger and `subjects_merged_into_idx` were
+  all **removed**. If the same person turns up on two accounts, **exclude the extra account** at
+  labelling/fetch time; do not reintroduce a merge column, and do not add a `coalesce()` collapse
+  to the training view. This is safe because the cohort is ~25 hand-recruited contributors
+  labelled by email, so a duplicate surfaces while labelling — **not** because the sign-in gate
+  prevents duplicates (it does not; one person can hold two emails).
+- **`movesTargets` is load-bearing and must not be removed as "unused".** It decides whether a
+  segment's `trajectory` carries per-frame `tx/ty/tz`. `strafing` is a shipping routine with a
+  genuinely moving target and sets it; stripping it would silently destroy that routine's
+  tracking-error signal. It is easy to confuse with the removed `board_trajectory` /
+  `tracksBoardTrajectory` (the *non-engaged* targets' paths, which only the withheld `switching`
+  ever wrote) — those are gone, `movesTargets` stays.
 - **Consent is a server-side insert precondition, not only a client gate.** The `sessions` insert
   policy requires `current_consent_version() is not null`, so `canPlay()`/`applyStartGate()` are
   now the UX layer over a database rule, not the only check.
@@ -461,9 +468,8 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
 - `src/telemetry.js` builds two payloads (`buildSessionPayload`, `buildSegmentPayload`)
   and stores streams **columnar** (parallel arrays keyed by field name): `trajectory`
   (per rendered frame; `tx/ty/tz` omitted for static-target routines — `sampling_version` 4),
-  `input_events` (**delta-encoded `{t0, dt, dx, dy}`** in tenths of a millisecond, one entry per
-  raw pointer sample), and `board_trajectory` (the non-engaged targets' per-frame paths, only for
-  a multi-target moving routine). Each segment also carries `duration_ms` (lifted from the
+  and `input_events` (**delta-encoded `{t0, dt, dx, dy}`** in tenths of a millisecond, one entry
+  per raw pointer sample). Each segment also carries `duration_ms` (lifted from the
   trajectory tail). `buildSessionPayload` must **not** emit `poll_hz` (service-written, not in the
   insert grant — see the column-grant invariant above).
 - `src/game.js` mints the session id in `start()` (`newSessionId()` → `crypto.randomUUID` with a
@@ -516,8 +522,8 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   underlying guarantee is unchanged and still enforced server-side: **no auth session, no
   write.**
 - The pipeline's fetch stage (**not yet written**) is meant to select from the
-  **`v_training_segments`** view with the service key. The view emits the **canonical**
-  `subject_id` (`merged_into` collapsed) plus `board_trajectory`/`duration_ms`, and runs
+  **`v_training_segments`** view with the service key. The view emits `subject_id` (one subject
+  row is one identity — there is no merge/collapse step) plus `duration_ms`, and runs
   `security_invoker`. **`is_human` is three-valued** — `true`/`false`/`NULL`, where `NULL`
   is an unlabelled subject (the default state of every public signup) and must be excluded
   with `where is_human is not null`, never coerced or imputed. The view also emits
@@ -575,8 +581,10 @@ Rules the v2 design encodes, worth preserving in any migration:
   `subjects_label_has_provenance` forces `kind_source` to move with them, so a label can
   never exist without its provenance. Synthetic reference data is produced by driving a bot
   in a real browser under a subject provisioned server-side as `kind='synthetic'`
-  (`kind_source='provisioned'`), never by trusting a client flag. `sessions.bot_mode` is
-  legacy and always null now. **Model predictions must never be written back into `kind`** —
+  (`kind_source='provisioned'`), never by trusting a client flag. (`sessions.bot_mode`, the
+  legacy per-session flag, has been **dropped** — do not reintroduce a client-controlled bot
+  field; that is exactly what the subject-level label replaced.) **Model predictions must never
+  be written back into `kind`** —
   ground truth is what a person decided; a retrain that consumes its predecessor's guesses
   amplifies its own errors.
 - **Append-only on every telemetry table: no update or delete policy on `subjects`,
@@ -674,7 +682,7 @@ buffer isolation, outbox delivery). To do that:
   a `file://` URL) that maps `three` to `node_modules/three/build/three.module.js` and any
   `.../supabase.js` to a capturing stub; then drive `game.js` with a stub `document` that
   records handlers by type. This is how the segment-payload shape (`engaged_index`,
-  `board_trajectory`, `duration_ms`) is validated headlessly.
+  `duration_ms`, and the `movesTargets` tx/ty/tz branch) is validated headlessly.
 - `src/outbox.js` is pure and injectable: pass `send`/`store`/`currentOwner` stubs to check
   batching, idempotent dedupe (`23505` settles), retry-on-failure, the **`23503` transient** path,
   **owner-scoped skip** (a foreign-owner row is held, not dropped), the **bounded keepalive**, and

@@ -75,8 +75,8 @@ For the tail it pages through **`v_training_segments`**, and two properties are 
 - Incremental pulls must **lag** (`segment_created_at < now() - interval '1 hour'`): a row can
   commit after your snapshot with an earlier `created_at` and be missed otherwise.
 
-The view emits the **canonical** `subject_id` (`merged_into` collapsed) plus
-`board_trajectory`/`duration_ms`, runs `security_invoker`, and also carries `segment_created_at`,
+The view emits `subject_id` (one subject row is one identity — duplicate merging was removed, so
+there is no collapse step) plus `duration_ms`, runs `security_invoker`, and also carries `segment_created_at`,
 `session_ended_at`, `subject_kind_source`, `subject_cohort`, `subject_labeled_at` and
 `subject_consent_version`.
 
@@ -141,7 +141,7 @@ guards it.
 ## Training
 
 - **Split train/test by `subject_id` (GroupKFold), never by row.** The view's
-  `merged_into`-collapsed `subject_id` exists to be that grouping key. Rows from one subject are
+  `subject_id` is that grouping key (one row, one identity — no merging). Rows from one subject are
   correlated samples of one motor process, not independent observations — the effective sample
   size is the number of **subjects** (~20 human + ~5 synthetic), not the ~45k rows.
 - **Leave-one-bot-variant-out is the headline evaluation.** Hold out an entire `cohort`

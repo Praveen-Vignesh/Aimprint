@@ -176,12 +176,6 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
       tz: engaged === null ? null : engaged.position.z,
       on
     });
-
-    // Multi-target moving routines also record every live target's position, in
-    // lockstep with the frame above so the two streams share a frame count.
-    if (routine.tracksBoardTrajectory === true) {
-      telemetry.sampleBoard(routine.targets.map((target) => target.position));
-    }
   }
 
   // A segment is one row. It opens on spawn/re-arm, on a click, or on a window
@@ -211,9 +205,10 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
     // Shipped: the buffer is now spoken for. Only beginAttempt() reopens one.
     segmentOpen = false;
 
+    // The targets snapshot taken at segment start — feeds `targets` and
+    // `target_count`. (Not the removed per-frame board_trajectory.)
     const board = telemetry.board();
     const inputs = telemetry.inputs();
-    const boardFrames = telemetry.boardFrames();
     const {
       targetDistance = null,
       timeToClickMs = null,
@@ -236,9 +231,8 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
         engagedIndex: engagedIndexAtStart,
         frames,
         inputs,
-        boardFrames,
         // Static-target routines omit per-frame tx/ty/tz (sampling_version 4);
-        // only strafing/switching declare movesTargets.
+        // `strafing` declares movesTargets and depends on this being kept.
         movesTargets: routine.movesTargets === true
       })
     );

@@ -48,6 +48,33 @@
 -- implicit transaction — rolls back every other change in the run.
 
 -- ---------------------------------------------------------------------------
+-- Drop the training view FIRST — ordering is load-bearing
+-- ---------------------------------------------------------------------------
+-- THE RULE: Postgres refuses to drop a column while any other object still
+-- references it —
+--     ERROR 2BP01: cannot drop column X because other objects depend on it
+-- and because this whole file runs as ONE implicit transaction, that failure
+-- rolls back every other change in the run. So every dependent object must come
+-- down BEFORE the `drop column` that needs it, and is rebuilt later in the file.
+--
+-- Two kinds of dependent exist here, and they live in different places:
+--
+--   * VIEWS — dropped here, at the top. `drop view if exists` is safe even on a
+--     brand-new database, because it resolves nothing but the view itself.
+--     v_training_segments reads subjects/sessions/segments and is recreated in
+--     full at the end of this file. It holds no data; dropping it is free.
+--
+--   * RLS POLICIES — dropped next to their own table, further down, NOT here.
+--     `drop policy ... on public.<table>` has to resolve the table, which does
+--     not exist yet at this point on a fresh database. See the `sessions insert
+--     own` drop sitting immediately above `drop column bot_mode`.
+--
+-- Both have already cost a rolled-back run: the view (merged_into,
+-- board_trajectory) and the sessions insert policy (bot_mode). When you drop a
+-- column in future, grep for every view and policy that names it first.
+drop view if exists public.v_training_segments;
+
+-- ---------------------------------------------------------------------------
 -- subjects
 -- ---------------------------------------------------------------------------
 -- The stable identity every session hangs off. Deliberately NOT auth.users:
@@ -91,14 +118,13 @@ create table if not exists public.subjects (
   consent_version text,
   consented_at timestamptz,
 
-  -- Deduplication. One human can land on more than one subject — a second
-  -- browser, cleared storage, a new device each mints a fresh auth user and so
-  -- a fresh subject via the trigger below. Point the duplicates at the survivor
-  -- here (never merge the rows: append-only), and the training view collapses
-  -- them to one identity. NULL means "this row is itself canonical". Left unset
-  -- the ML grouping key (subject_id) would leak the same person across a
-  -- train/test split and silently inflate accuracy.
-  merged_into uuid references public.subjects(subject_id),
+  -- REMOVED: merged_into. Duplicate-identity merging was dropped — every
+  -- subject is its own canonical identity. The campaign is ~25 hand-recruited
+  -- contributors labelled by email, so a person who signs up twice surfaces
+  -- during labelling and the extra account is excluded rather than merged.
+  -- (Note for anyone revisiting this: requiring an account does NOT prevent
+  -- duplicate identities — one person can hold two emails. What makes it safe
+  -- here is the small, personally-known cohort, not the sign-in gate.)
 
   -- How `kind` was decided, so a synthetic subject provisioned by hand is
   -- distinguishable from one that merely defaulted. 'default' is the trigger's
@@ -125,8 +151,6 @@ create table if not exists public.subjects (
 -- Additive migration for databases created before these columns existed.
 -- `create table if not exists` above is a no-op on an existing table, so the
 -- columns have to be added explicitly for a re-run to upgrade in place.
-alter table public.subjects
-  add column if not exists merged_into uuid references public.subjects(subject_id);
 alter table public.subjects
   add column if not exists kind_source text not null default 'default';
 -- These two are what actually upgrade a live database; the create table above
@@ -231,74 +255,19 @@ begin
   end if;
 end $$;
 
--- merged_into integrity. The training view collapses a subject onto its
--- survivor with coalesce(merged_into, subject_id), which resolves EXACTLY ONE
--- level: with A->B and B->C, A collapses to B but C stays separate, so one
--- person lands on both sides of a GroupKFold split. For the bot detector that
--- silently inflates accuracy; for biometric identification it is fatal, since
--- telling people apart IS the task. These two guards pin the chain depth at 1.
+-- Drop the merged_into machinery. Duplicate-identity merging is gone, so the
+-- self-reference CHECK, the depth-guard trigger and its function all go with it.
 --
--- Self-reference is a plain CHECK (a subject cannot be its own survivor).
-do $$
-begin
-  if not exists (
-    select 1 from pg_constraint
-     where conrelid = 'public.subjects'::regclass
-       and conname = 'subjects_merged_into_not_self'
-  ) then
-    alter table public.subjects
-      add constraint subjects_merged_into_not_self
-      check (merged_into is distinct from subject_id);
-  end if;
-end $$;
-
--- Chain and fan-in need a trigger, because a CHECK cannot read other rows. It
--- rejects (a) pointing at a subject that is itself already merged, and (b)
--- merging a subject that is already somebody else's survivor — together that is
--- depth <= 1 in both directions, which is exactly what the view's one-level
--- coalesce assumes. SECURITY DEFINER with an empty search_path (every reference
--- is schema-qualified; pg_catalog is always implicitly searched).
-create or replace function public.enforce_merge_depth()
-returns trigger
-language plpgsql
-security definer
-set search_path = ''
-as $$
-begin
-  if new.merged_into is null then
-    return new;
-  end if;
-
-  -- (a) the survivor must itself be canonical.
-  if exists (
-    select 1 from public.subjects
-     where subject_id = new.merged_into
-       and merged_into is not null
-  ) then
-    raise exception
-      'cannot merge % into %, which is itself merged (no merge chains)',
-      new.subject_id, new.merged_into;
-  end if;
-
-  -- (b) this subject must not already be a survivor others point at.
-  if exists (
-    select 1 from public.subjects
-     where merged_into = new.subject_id
-  ) then
-    raise exception
-      'cannot merge %, which is already the survivor of another subject',
-      new.subject_id;
-  end if;
-
-  return new;
-end;
-$$;
-
+-- Order matters and is deliberate: the trigger and function are dropped FIRST.
+-- Dropping the column cascades to the CHECK and the index that depend on it, but
+-- a function is a free-standing object that no column drop removes — leaving it
+-- behind would strand a SECURITY DEFINER function referencing a column that no
+-- longer exists. Idempotent: every statement is `if exists`, so a re-run against
+-- an already-migrated database is a no-op, and a fresh database (where the
+-- column was never created) skips all three cleanly.
 drop trigger if exists subjects_enforce_merge_depth on public.subjects;
-
-create trigger subjects_enforce_merge_depth
-  before insert or update of merged_into on public.subjects
-  for each row execute function public.enforce_merge_depth();
+drop function if exists public.enforce_merge_depth();
+alter table public.subjects drop column if exists merged_into;
 
 -- ---------------------------------------------------------------------------
 -- Labelling a subject  (service key / SQL editor ONLY)
@@ -350,16 +319,10 @@ create trigger subjects_enforce_merge_depth
 --   select kind, kind_source, cohort, count(*)
 --     from public.subjects group by 1,2,3 order by 1,2,3;
 --
--- After labelling, confirm no canonical identity carries divergent labels. The
--- view collapses subject_id through merged_into but reads `kind` off the RAW
--- row, so labelling one of a person's duplicate accounts and missing the other
--- makes half their segments emit NULL and be dropped by the pipeline's filter —
--- data loss for a subject you did label, with no error. Expect zero rows:
---
---   select coalesce(sub.merged_into, sub.subject_id) as canonical
---     from public.subjects sub group by 1
---    having count(distinct sub.kind) > 1
---        or count(distinct coalesce(sub.cohort,'')) > 1;
+-- (The old "divergent labels across merged duplicates" gate is gone with
+-- merged_into: every subject is now its own identity, so one row carries exactly
+-- one label and there is nothing to diverge. If you ever spot the same person on
+-- two accounts, exclude the extra one — do not try to reconcile them here.)
 
 -- ---------------------------------------------------------------------------
 -- profiles
@@ -371,10 +334,15 @@ create table if not exists public.profiles (
   user_id uuid primary key references auth.users(id) on delete cascade,
   subject_id uuid not null unique references public.subjects(subject_id),
   created_at timestamptz not null default now(),
-  display_name text,
   consent_version text,
   consented_at timestamptz
 );
+
+-- REMOVED: display_name. It was always NULL — handle_new_user() writes only
+-- (user_id, subject_id), no UI ever collected a name, nothing read it, and the
+-- column grant below never made it writable. Dropped rather than left as an
+-- unexplained empty column.
+alter table public.profiles drop column if exists display_name;
 
 create or replace function public.handle_new_user()
 returns trigger
@@ -592,18 +560,37 @@ create table if not exists public.sessions (
   screen_height int,
   device_pixel_ratio double precision,
 
-  -- LEGACY. The in-browser Bot Mode was removed, so the client no longer writes
-  -- this and it is always null on new rows. Kept as a column so old rows still
-  -- parse. Synthetic data is now produced only under a subject explicitly
-  -- flagged kind='synthetic' (kind_source='provisioned'); the label lives on the
-  -- subject, never on a client-controlled per-session field.
-  bot_mode text,
+  -- REMOVED: bot_mode. It was the legacy of an in-browser Bot Mode that no
+  -- longer exists, and was always null on every new row. Synthetic data is
+  -- produced only under a subject explicitly flagged kind='synthetic'
+  -- (kind_source='provisioned') — the label belongs on the subject, never on a
+  -- client-controlled per-session field, which is the whole reason Bot Mode was
+  -- removed in the first place. Do not reintroduce a per-session bot flag.
 
   -- Stamp of the code that produced the session. Without it, a change to the
   -- sampler or to difficulty.js silently mixes incomparable rows into one set.
   app_version text not null default 'unknown',
   sampling_version int not null default 4
 );
+
+-- Drop the legacy column (idempotent; a no-op on a fresh database).
+--
+-- The policy drop below is REQUIRED, not tidiness. The LIVE `sessions insert
+-- own` policy still carries `and bot_mode is null` from the previous run, and
+-- Postgres refuses to drop a column that any policy references:
+--     ERROR 2BP01: cannot drop column bot_mode of table sessions because other
+--     objects depend on it
+-- The policy is recreated — without that clause — in the Row-level-security
+-- section below, so dropping it here costs nothing. The whole file is one
+-- transaction, so no client ever observes the window in which `sessions` has no
+-- insert policy.
+--
+-- It lives HERE rather than in the teardown block at the top of the file
+-- because `drop policy ... on public.sessions` has to resolve the table, and on
+-- a genuinely fresh database that table does not exist that early. A view drop
+-- has no such problem, which is why only the view sits up top.
+drop policy if exists "sessions insert own" on public.sessions;
+alter table public.sessions drop column if exists bot_mode;
 
 -- Additive migration for databases created before timed sessions shipped.
 -- `create table if not exists` above is a no-op on an existing table, so the
@@ -715,15 +702,16 @@ create table if not exists public.segments (
   trajectory jsonb not null,
   input_events jsonb,
 
-  -- The paths of the NON-engaged targets, per rendered frame, for a routine
-  -- that holds several MOVING targets at once (switching). trajectory only
-  -- carries the engaged target's tx/ty/tz, so without this the other targets'
-  -- motion is unrecoverable — and "how far was the next target, did they switch
-  -- to the nearest" is exactly the signal that routine exists to measure. NULL
-  -- for single-target and static routines (flick, gridshot, spidershot,
-  -- strafing), where `targets` at segment start already describes the board.
-  -- Columnar and aligned to `targets`: {x: [[per-frame] per target], y, z}.
-  board_trajectory jsonb,
+  -- REMOVED: board_trajectory. It recorded the per-frame paths of the
+  -- NON-engaged targets, and only one routine ever wrote it — `switching`, the
+  -- multi-target moving drill, which is withheld from the UI. No shipping
+  -- routine populated it, so every row had it NULL. Reviving `switching` means
+  -- re-adding this column, its shape guard, its lz4 line and its grant entry.
+  --
+  -- NOTE: this is NOT the same thing as `trajectory`'s tx/ty/tz, which records
+  -- the ENGAGED target's path and is still written by `strafing` (a shipping
+  -- routine with a moving target). Removing that would destroy strafing's
+  -- tracking-error signal — see `movesTargets` in src/telemetry.js.
 
   -- Lengths lifted out of the jsonb so segments can be filtered and sanity
   -- checked without parsing either blob.
@@ -752,8 +740,10 @@ create table if not exists public.segments (
 );
 
 -- Additive migration for databases created before these columns existed.
-alter table public.segments add column if not exists board_trajectory jsonb;
 alter table public.segments add column if not exists duration_ms int;
+
+-- Drop the withheld multi-target column (idempotent; no-op on a fresh database).
+alter table public.segments drop column if exists board_trajectory;
 
 -- Sanity bounds on fields the model reads directly. None of these should ever
 -- be violated by the client as it stands today; they exist so a bug (or a
@@ -804,8 +794,7 @@ end $$;
 --
 -- input_events uses key 'dt' because sampling_version 4 delta-encodes it:
 -- {t0, dt:[...], dx, dy} with dt[0]=0, so len(dt) == event_count exactly. The
--- trajectory key stays 't'. board_trajectory is {x,y,z} of per-target arrays,
--- so its outer length is target_count.
+-- trajectory key stays 't'.
 --
 -- ALL FIVE are NOT VALID, and that is load-bearing, not a convenience. The
 -- table is NOT empty: a live database may already hold pre-v4 rows whose
@@ -844,15 +833,6 @@ begin
   end if;
   if not exists (select 1 from pg_constraint
                   where conrelid = 'public.segments'::regclass
-                    and conname = 'segments_board_trajectory_len_matches') then
-    alter table public.segments add constraint segments_board_trajectory_len_matches
-      check (
-        board_trajectory is null
-        or jsonb_array_length(board_trajectory -> 'x') = target_count
-      ) not valid;
-  end if;
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.segments'::regclass
                     and conname = 'segments_engaged_index_in_range') then
     alter table public.segments add constraint segments_engaged_index_in_range
       check (engaged_index is null or (engaged_index >= 0 and engaged_index < target_count)) not valid;
@@ -873,11 +853,14 @@ end $$;
 --
 -- Wrapped so a server built without lz4 degrades to a notice instead of
 -- rolling back the entire migration (the whole file is one transaction).
+-- Every statement here shares ONE exception handler, so a single failing line
+-- rolls back the whole block — the others would silently revert to pglz while
+-- reporting only "lz4 unavailable". That is why the dropped board_trajectory
+-- line was removed rather than left to error. Keep this block to live columns.
 do $$
 begin
-  alter table public.segments alter column trajectory       set compression lz4;
-  alter table public.segments alter column input_events     set compression lz4;
-  alter table public.segments alter column board_trajectory set compression lz4;
+  alter table public.segments alter column trajectory   set compression lz4;
+  alter table public.segments alter column input_events set compression lz4;
 exception when others then
   raise notice 'lz4 compression unavailable (%), leaving default pglz', sqlerrm;
 end $$;
@@ -925,7 +908,7 @@ create table if not exists public.session_metrics (
 -- without reading the blobs: one row per archived session, with the checksum
 -- that gated the delete.
 --
--- It stores raw_subject_id, NEVER a resolved label. kind/cohort/merged_into are
+-- It stores raw_subject_id, NEVER a resolved label. kind and cohort are
 -- joined LIVE from subjects at train time, so retroactive relabelling still
 -- works after a session is archived (label a contributor today, every archived
 -- session of theirs reclassifies). Freezing is_human here would destroy that.
@@ -983,10 +966,9 @@ drop index if exists public.segments_session_idx;
 drop index if exists public.segments_outcome_idx;
 create index if not exists subjects_kind_idx
   on public.subjects (kind);
--- Resolving a subject to its canonical identity in the training view, and
--- listing everything merged into a survivor.
-create index if not exists subjects_merged_into_idx
-  on public.subjects (merged_into);
+-- subjects_merged_into_idx is gone with the merged_into column; the column drop
+-- above cascades to it, and recreating it here would error against a column
+-- that no longer exists.
 -- Incremental pulls ("every segment since the last fetch") and the archive job's
 -- age selection both need to range-scan created_at. BRIN, not btree, precisely
 -- because the table is append-only: created_at is perfectly correlated with
@@ -1024,8 +1006,8 @@ alter table public.archive_manifest enable row level security;
 -- subjects: no client policy of any kind. `kind` in particular must stay
 -- unwritable, or a synthetic run could relabel itself human.
 
--- profiles: a user may read their own row (display name, consent state) and
--- update the two consent columns. The subject link is not writable.
+-- profiles: a user may read their own row (consent state) and update the two
+-- consent columns. The subject link is not writable.
 drop policy if exists "profiles select own" on public.profiles;
 create policy "profiles select own"
   on public.profiles for select to authenticated
@@ -1040,8 +1022,8 @@ create policy "profiles update own"
 -- RLS alone cannot restrict *which columns* an update touches — the policy
 -- above passes for any column value as long as user_id/subject_id are intact.
 -- Column-level grants are what actually confine a write to the two consent
--- columns, matching the comment above this table; without this, display_name
--- and created_at are just as writable via the same policy.
+-- columns, matching the comment above this table; without this, created_at
+-- would be just as writable via the same policy.
 revoke update on public.profiles from authenticated;
 grant update (consent_version, consented_at) on public.profiles to authenticated;
 
@@ -1061,7 +1043,6 @@ create policy "sessions insert own"
     and (select public.current_consent_version()) is not null
     and ended_at is null
     and poll_hz is null
-    and bot_mode is null
   );
 
 drop policy if exists "sessions select own" on public.sessions;
@@ -1071,7 +1052,7 @@ create policy "sessions select own"
 
 -- Column-level insert grant. RLS gates which ROWS you may insert, never which
 -- COLUMNS — the policy above passes for any value of any column. So the fields
--- documented as SERVICE-WRITTEN (started_at, ended_at, poll_hz, bot_mode) were
+-- documented as SERVICE-WRITTEN (started_at, ended_at, poll_hz) were
 -- forgeable despite their comments. Revoking table-level insert and granting it
 -- per column is what actually confines the client, exactly as the profiles
 -- UPDATE grant does. `id` IS granted: the client mints the session uuid so a
@@ -1117,7 +1098,7 @@ grant insert (
   session_id, segment_index, started_at_ms, outcome, target_distance,
   time_to_click_ms, dwell_ms, click_offset_x, click_offset_y,
   target_count, targets, engaged_index, trajectory, input_events,
-  board_trajectory, frame_count, event_count, duration_ms
+  frame_count, event_count, duration_ms
 ) on public.segments to authenticated;
 
 -- session_metrics: read your own. Writes are service-key only.
@@ -1157,11 +1138,11 @@ create policy "session metrics select own"
 -- single future GRANT would otherwise expose every subject's trajectories
 -- through an owner-privileged view.
 --
--- subject_id is the CANONICAL identity: merged duplicates collapse onto their
--- survivor via merged_into, so this is the correct grouping key for a
--- train/test split. raw_subject_id keeps the un-collapsed value for auditing a
--- merge. Collapsing here means a later merge is a single UPDATE with zero
--- pipeline changes.
+-- subject_id is the grouping key for a train/test split (GroupKFold). There is
+-- no longer any merge/collapse step: duplicate-identity merging was removed, so
+-- one subject row is one identity, full stop. If the same person ever turns up
+-- on two accounts, exclude the extra one at fetch time rather than reconciling
+-- them here.
 --
 -- Dropped and recreated rather than CREATE OR REPLACE: replace can only append
 -- columns to the end of an existing view, and this revision both changes the
@@ -1192,8 +1173,7 @@ with (security_invoker = true) as
 select
   g.id                              as segment_id,
   s.id                              as session_id,
-  coalesce(sub.merged_into, sub.subject_id) as subject_id,
-  sub.subject_id                    as raw_subject_id,
+  sub.subject_id,
   -- THREE-VALUED, and deliberately nullable. `sub.kind = 'human'` returned
   -- false for a confirmed synthetic subject AND for an unlabelled stranger,
   -- collapsing "measured non-human" and "nobody has checked" into one value
@@ -1241,7 +1221,6 @@ select
   g.engaged_index,
   g.trajectory,
   g.input_events,
-  g.board_trajectory,
   g.frame_count,
   g.event_count,
   g.duration_ms

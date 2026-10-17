@@ -55,13 +55,13 @@ or PG18. Not worth doing now.
 
 ---
 
-## 4. Open question — `profiles.display_name`
+## 4. ~~Open question — `profiles.display_name`~~ — RESOLVED 2026-10-17: dropped
 
-Still always NULL: nothing writes it (`handle_new_user()` inserts only `(user_id, subject_id)`,
-and UPDATE on it is revoked), nothing reads it. Kept with a reserved-placeholder comment rather
-than dropped, on the chance a participant label is useful during recruitment. Decide before any
-future schema cleanup; dropping is irreversible:
+Decided: **dropped.** It was always NULL, nothing wrote it, nothing read it, and the column grant
+never made it writable, so there was nothing to preserve. `schema.sql` now carries
+`alter table public.profiles drop column if exists display_name;`.
 
-```sql
-alter table public.profiles drop column display_name;
-```
+Dropped in the same pass, for the same "no code path ever writes this" reason:
+`subjects.merged_into` (duplicate merging removed entirely), `sessions.bot_mode` (legacy Bot Mode
+flag), and `segments.board_trajectory` (only the withheld `switching` routine ever wrote it).
+Full record and the two ordering traps it exposed: `AUDIT-2026-10.md` follow-up section.

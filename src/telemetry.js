@@ -43,7 +43,9 @@ function roundPos(units) {
 export function createTelemetry() {
   let frames = [];
   let inputs = [];
-  let boardFrames = [];
+  // `board` is the TARGETS SNAPSHOT at segment start (feeds `targets` and
+  // `target_count`) — not to be confused with the removed per-frame
+  // board_trajectory, which recorded the non-engaged targets' paths.
   let board = [];
   let segmentStart = 0;
 
@@ -56,7 +58,6 @@ export function createTelemetry() {
       segmentStart = timestamp;
       frames = [];
       inputs = [];
-      boardFrames = [];
       board = boardSnapshot;
     },
 
@@ -76,25 +77,6 @@ export function createTelemetry() {
         tz: roundPos(tz),
         on: on ? 1 : 0
       });
-    },
-
-    // The world position of every live target this frame, in routine.targets
-    // order, so a multi-target moving routine's non-engaged paths are not lost
-    // (trajectory only carries the engaged target). Called every frame in
-    // lockstep with sample() when the routine opts in, so its frame count
-    // matches. Within one segment the target set and order are stable — targets
-    // are only released at segment close — so index i is the same physical
-    // target every frame and aligns with the `targets` snapshot.
-    sampleBoard(positions) {
-      const row = new Array(positions.length);
-      for (let i = 0; i < positions.length; i++) {
-        row[i] = {
-          x: roundPos(positions[i].x),
-          y: roundPos(positions[i].y),
-          z: roundPos(positions[i].z)
-        };
-      }
-      boardFrames.push(row);
     },
 
     // One entry per raw pointer sample (getCoalescedEvents), at the native
@@ -118,10 +100,6 @@ export function createTelemetry() {
 
     inputs() {
       return inputs;
-    },
-
-    boardFrames() {
-      return boardFrames;
     },
 
     board() {
@@ -173,39 +151,6 @@ function toColumnar(frames, movesTargets = false) {
   }
 
   return columns;
-}
-
-// The board trajectory columnar: outer index is the target (aligned to the
-// segment's `targets` snapshot), inner index is the frame. {x, y, z} arrays of
-// per-target arrays. A cell can be null if a frame ever carried fewer targets;
-// within a segment that does not happen, but the guard keeps the shape total.
-function toBoardColumnar(boardFrames) {
-  const frameCount = boardFrames.length;
-  if (frameCount === 0) return null;
-
-  const targetCount = boardFrames[0].length;
-  const x = [];
-  const y = [];
-  const z = [];
-
-  for (let target = 0; target < targetCount; target++) {
-    const xi = new Array(frameCount);
-    const yi = new Array(frameCount);
-    const zi = new Array(frameCount);
-
-    for (let frame = 0; frame < frameCount; frame++) {
-      const cell = boardFrames[frame][target];
-      xi[frame] = cell ? cell.x : null;
-      yi[frame] = cell ? cell.y : null;
-      zi[frame] = cell ? cell.z : null;
-    }
-
-    x.push(xi);
-    y.push(yi);
-    z.push(zi);
-  }
-
-  return { x, y, z };
 }
 
 // Columnar + DELTA-encoded raw input stream (sampling_version 4): {t0, dt, dx,
@@ -327,17 +272,14 @@ export function buildSegmentPayload({
   engagedIndex = null,
   frames,
   inputs = [],
-  boardFrames = [],
   // Whether the engaged target moved during the segment. Drives whether
   // trajectory carries tx/ty/tz (moving) or omits it (static — see toColumnar).
+  // `strafing` is a shipping routine that sets this, so do not remove it.
   movesTargets = false
 }) {
   // Nullable by design: a session may run without raw capture. Store null rather
   // than an empty stream so "not captured" is distinct from "captured nothing".
   const hasInputs = inputs.length > 0;
-  // Only recorded for multi-target moving routines; otherwise the per-frame
-  // board array is empty and the column stays null.
-  const hasBoard = boardFrames.length > 0;
 
   return {
     segment_index: segmentIndex,
@@ -353,7 +295,6 @@ export function buildSegmentPayload({
     engaged_index: engagedIndex,
     trajectory: toColumnar(frames, movesTargets),
     input_events: hasInputs ? inputsToColumnar(inputs) : null,
-    board_trajectory: hasBoard ? toBoardColumnar(boardFrames) : null,
     frame_count: frames.length,
     event_count: hasInputs ? inputs.length : null,
     // Segment wall-time: the last frame's t is milliseconds from segment start,

@@ -10,7 +10,8 @@
 > - `subjects.kind` default is `'unknown'` (§6 check 3) ✅
 > - `subjects_kind_allowed` holds all three values; **no** leftover auto-named
 >   `subjects_kind_check` ✅
-> - `cohort`, `labeled_at`, `kind_source`, `merged_into` all present ✅
+> - `cohort`, `labeled_at`, `kind_source` all present ✅ (`merged_into` was also
+>   present then; it has since been **removed** — see the 2026-10-17 addendum)
 > - `v_training_segments` exists, exposes `subject_kind_source` /
 >   `subject_cohort` / `subject_labeled_at`, and `is_human` is **three-valued**
 >   (`CASE` present) ✅ — this is the precondition §5.1 demands
@@ -40,8 +41,7 @@
 > ### Addendum 2026-10-10 — pre-collection hardening (NOT yet applied to live)
 > The pre-collection pass (`AUDIT-2026-10.md`) added more to `schema.sql`: a
 > server-side **consent precondition** on the `sessions` insert policy,
-> `merged_into` **depth-1 guards** (a self-reference CHECK plus the
-> `enforce_merge_depth` trigger), column-level insert grants, five segment shape
+> column-level insert grants, segment shape
 > CHECKs, `search_path = ''` on the SECURITY DEFINER functions, the orphan-repair
 > block, a BRIN index, and the `archive_manifest` table. **These are in the file
 > but have NOT been applied to the live database.** Paste `schema.sql` as one
@@ -53,6 +53,23 @@
 > `subjects` at train time, so relabelling stays retroactive across the archive
 > boundary. §5.6 (labelling the batches) is still the only outstanding manual
 > step and cannot start before Phase 6 recruitment / bot provisioning.
+>
+> ### Addendum 2026-10-17 — `merged_into` removed (also NOT yet applied to live)
+> Duplicate-identity merging has been **deleted** from the schema: the
+> `merged_into` column, its self-reference CHECK, the `enforce_merge_depth`
+> trigger and function, and `subjects_merged_into_idx`. The training view no
+> longer collapses anything — **one `subjects` row is one identity.** §5.7 (the
+> divergent-label gate) is therefore **removed from this runbook**; with no
+> merging, a subject carries exactly one label and there is nothing to diverge.
+>
+> If the same person turns up on two accounts, **exclude the extra account**
+> rather than reconciling them. That is safe only because this cohort is ~25
+> hand-recruited contributors labelled by email, so a duplicate shows up while
+> labelling. Requiring an account does **not** prevent duplicates — one person
+> can hold two emails — so if this ever opens to public signups, merging has to
+> come back. Dropped alongside it, for the same "never written by anything"
+> reason: `profiles.display_name`, `sessions.bot_mode`,
+> `segments.board_trajectory` (see `AUDIT-2026-10.md` follow-up).
 
 **What this document is.** Why the human-vs-bot ground-truth label was unsafe,
 what changed, and the runbook for applying it. `schema.sql` is authoritative for
@@ -247,21 +264,16 @@ for human contributors (`kind_source='reviewed'`). Check the `returning` row
 count against the number of emails you passed — **zero rows back means nothing
 was labeled.**
 
-### 5.7 Required gate: check for divergent labels across merged duplicates
+### 5.7 ~~Required gate: divergent labels across merged duplicates~~ — REMOVED
 
-```sql
-select coalesce(sub.merged_into, sub.subject_id) as canonical
-  from public.subjects sub group by 1
- having count(distinct sub.kind) > 1
-     or count(distinct coalesce(sub.cohort,'')) > 1;          -- expect 0 rows
-```
+This gate existed only because `merged_into` let two rows describe one person
+while `kind` was read off the raw row, so labelling one account and missing the
+other silently dropped half that subject's segments.
 
-**This is not optional.** The view collapses `subject_id` through `merged_into`
-but reads `kind` off the **raw** row. Before this change that was harmless —
-everything was `'human'`, so duplicates always agreed. Now, labelling one of a
-person's duplicate accounts and missing the other makes half their segments emit
-`NULL` and be silently dropped by the pipeline's filter: **data loss for a
-subject you did label, with no error.**
+**Merging was removed on 2026-10-17.** One `subjects` row is now one identity, it
+carries exactly one `kind`/`cohort`, and there is nothing to diverge — so there
+is no gate to run. If you spot the same person on two accounts, exclude the
+extra account instead.
 
 ---
 
@@ -336,7 +348,8 @@ collapse against real users. The `sessions` hardware-block comment already
 anticipates exactly this.
 
 - **Split train/test by `subject_id`, never by row** (`GroupKFold`). The view's
-  `merged_into`-collapsed `subject_id` exists to be that grouping key.
+  `subject_id` is that grouping key — one subject row is one identity, with no
+  merge/collapse step.
 - **Train twice — with and without the hardware block — and compare.** A large
   gap means the model learned hardware.
 - **Vary the bots' hardware**, or run variants on more than one machine.
@@ -401,7 +414,7 @@ defects, all now fixed:
 | D1 | The `drop trigger on_auth_user_created` chunked-paste window — a signup landing in it is permanently unrecordable, silently | One-buffer warning in the file header + orphan-detection query (§4) |
 | D2 | Verification was ordered *after* the backfill, but the view check is a **precondition** of it | §5.1 now runs first |
 | D3 | `validate constraint` checks all rows; the backfill only touched `kind='human'` | §5.2 broadened to `kind <> 'unknown'`; §5.3 added |
-| D4 | `merged_into` duplicates can now carry divergent labels → silent data loss | §5.7 promoted to a required gate |
+| D4 | `merged_into` duplicates can now carry divergent labels → silent data loss | §5.7 promoted to a required gate — *since moot: merging removed 2026-10-17, §5.7 retired* |
 | D5 | The view's own header comment still described a plain boolean — and it is the canonical contract for `fetch_telemetry.py` | Rewritten in `schema.sql` |
 | D6 | `CLAUDE.md` specified a boolean `--is-human` CLI flag for a now-three-valued column | Replaced with three-state `--label`; 4 `CLAUDE.md` sites updated, not 2 |
 
