@@ -313,28 +313,20 @@ create table public.sessions (
   id uuid primary key default gen_random_uuid(),
   subject_id uuid not null references public.subjects(subject_id) on delete cascade,
 
-  -- Server clock, and the one timestamp here that is not client-supplied:
-  -- ordering matters for both fatigue effects and replay detection, and
-  -- started_at is absent from the insert grant below, so it cannot be forged.
-  -- That is what makes it trustworthy to compare ended_at against.
+  -- Server clock, never client-supplied: ordering matters for both fatigue
+  -- effects and replay detection, and started_at is absent from the insert
+  -- grant below, so it cannot be forged.
+  --
+  -- There is deliberately NO `ended_at`. It was dropped on 2026-10-18: nothing
+  -- in scope consumes it. The completion verdict and every duration come from
+  -- segment timing (max(started_at_ms + duration_ms)) and started_at, so a
+  -- session's active-play span is always re-derivable from its segments. The
+  -- only thing a stored ended_at added — wall-clock span INCLUDING pauses — is
+  -- not a feature any model reads, and the pause structure a future model might
+  -- want is not recorded anyway. Carrying it meant the schema's only UPDATE
+  -- policy (a client write path into an otherwise append-only table); dropping
+  -- it restores strict append-only. See the RLS section.
   started_at timestamptz not null default now(),
-
-  -- Written by the client ONCE, at the end of the run, through the
-  -- `sessions close own` policy — the only UPDATE policy in this schema. It is
-  -- a client wall-clock and therefore forgeable; sessions_ended_at_sane below
-  -- is what catches a broken one. Acceptable because this column is
-  -- descriptive, never a model feature.
-  --
-  -- NOTE it is wall-clock end, whereas the frame clock excludes paused time, so
-  -- (ended_at - started_at) is NOT active play. Active play is
-  -- max(started_at_ms + duration_ms) over the session's segments, which is the
-  -- figure comparable to planned_duration_ms. The two differ by exactly the
-  -- paused spans, which are not otherwise recorded.
-  --
-  -- If a close request never lands (network blip, hard crash), the column stays
-  -- null and queries/campaign.sql section 5a backfills it from the segments
-  -- that did arrive.
-  ended_at timestamptz,
 
   routine text not null
     constraint sessions_routine_allowed
@@ -368,12 +360,14 @@ create table public.sessions (
   -- A rolling client estimate off the render loop.
   refresh_hz double precision,
   -- The measured pointer polling rate: the MEDIAN inter-arrival gap across the
-  -- whole run, computed by the client from its own input_events stream
-  -- (telemetry.js pollHz) and written with ended_at by the same one-shot close.
-  -- Median, not mean — one backgrounded tab produces a single enormous gap that
-  -- would drag a mean down by hundreds of Hz. Null when the run captured fewer
-  -- than POLL_MIN_SAMPLES pointer events; section 5b of queries/campaign.sql
-  -- backfills it from the stored stream if needed.
+  -- run's input_events. DERIVED OFFLINE with the service key — the client never
+  -- writes it (there is no update path), so it is null during live collection
+  -- and filled before training. queries/campaign.sql section 5 derives it, and
+  -- the archive job computes it for free since it already decodes every
+  -- segment's input_events. Median, not mean — one backgrounded tab produces a
+  -- single enormous gap that would drag a mean down by hundreds of Hz. The
+  -- service key bypasses RLS but NOT sessions_poll_hz_sane below, which still
+  -- guards the offline write.
   poll_hz double precision,
 
   -- Hardware/browser fingerprint. Coarse on purpose: enough to hold out a
@@ -395,22 +389,8 @@ create table public.sessions (
   -- client always sends it explicitly.
   sampling_version int not null default 1,
 
-  -- Sanity bounds on the two client-closed columns. started_at is
-  -- server-stamped and ungranted, so it is a trustworthy reference. The one-day
-  -- ceiling is deliberately loose — a paused session can legitimately sit for
-  -- hours — and exists to reject a broken clock, not an imprecise one.
-  --
-  -- Written as (ended_at - started_at) rather than the more obvious
-  -- `ended_at <= started_at + interval '1 day'` ON PURPOSE. A CHECK expression
-  -- must be immutable, and `timestamptz + interval` is only STABLE — adding a
-  -- day can cross a DST boundary, so its result depends on the session
-  -- TimeZone. Subtracting two timestamptz values yields an exact interval with
-  -- no timezone involved, so `timestamptz - timestamptz` IS immutable and this
-  -- form is accepted without argument.
-  constraint sessions_ended_at_sane check (
-    ended_at is null
-    or (ended_at >= started_at and ended_at - started_at <= interval '1 day')
-  ),
+  -- Sanity bound on poll_hz. It is written offline with the service key, which
+  -- bypasses RLS but NOT a CHECK, so this still rejects a garbage value.
   constraint sessions_poll_hz_sane check (
     poll_hz is null or (poll_hz > 0 and poll_hz <= 8000)
   )
@@ -709,12 +689,11 @@ create index segments_created_at_brin
 -- ---------------------------------------------------------------------------
 -- Row level security
 -- ---------------------------------------------------------------------------
--- Append-only for the client, with ONE exception: the single-shot
--- `sessions close own` update below, which writes ended_at/poll_hz once per run
--- and can never fire twice on the same row. There is no delete policy anywhere,
--- and no update policy on any other table — a behavioural reference set an
--- account holder can rewrite is not a reference set. Corrections are made with
--- the service key.
+-- Append-only for the client, with no exceptions: there is no UPDATE policy and
+-- no DELETE policy on ANY table here. A behavioural reference set an account
+-- holder can rewrite is not a reference set. Every correction, and every
+-- service-written column (poll_hz, the labels, session_metrics), is made with
+-- the service key, which bypasses RLS entirely.
 --
 -- anon has no privileges at all — writing requires a signed-in user whose
 -- subject the row already belongs to.
@@ -745,15 +724,15 @@ create policy "profiles select own"
 
 revoke update on public.profiles from authenticated;
 
--- sessions: insert and read your own, and close your own exactly once. The
--- null checks in the insert policy stop a client planting a value in a column
--- it is only allowed to write at CLOSE time, which would otherwise let it skip
--- the close policy's one-shot guard entirely.
+-- sessions: insert and read your own. No update policy — the row is immutable
+-- to the client once inserted. `poll_hz is null` in the insert check stops a
+-- client planting a value in a column that is only ever written offline with
+-- the service key; without an update policy there would be no way to correct a
+-- forged one.
 create policy "sessions insert own"
   on public.sessions for insert to authenticated
   with check (
     subject_id = (select public.current_subject_id())
-    and ended_at is null
     and poll_hz is null
   );
 
@@ -761,39 +740,15 @@ create policy "sessions select own"
   on public.sessions for select to authenticated
   using (subject_id = (select public.current_subject_id()));
 
--- THE ONE UPDATE POLICY IN THIS SCHEMA. It exists because ended_at and poll_hz
--- are not knowable when the row is inserted: the session row opens partway
--- through the run (at SESSION_MIN_PLAY_MS) and both values only exist once the
--- run has finished.
---
--- `using (ended_at is null)` is what makes it SINGLE-SHOT: once a row is closed
--- it no longer matches the policy, so no later update can touch it again — not
--- to correct it, not to overwrite it. `with check (ended_at is not null)` stops
--- it being used to re-open a row by nulling the column back out. Both sides pin
--- subject_id so the row cannot be reassigned to another subject on the way
--- through.
---
--- RLS cannot restrict WHICH COLUMNS an update writes — this policy passes for
--- any value of any column. The column-level grant below is what actually
--- confines it to two columns; without it, routine, dpi and every other field
--- would be just as writable through the same policy.
-create policy "sessions close own"
-  on public.sessions for update to authenticated
-  using (
-    subject_id = (select public.current_subject_id())
-    and ended_at is null
-  )
-  with check (
-    subject_id = (select public.current_subject_id())
-    and ended_at is not null
-  );
-
+-- No UPDATE policy on sessions (it had one briefly — a single-shot close that
+-- wrote ended_at/poll_hz — removed on 2026-10-18 with the ended_at column).
+-- The revoke mirrors profiles: the client has no update path at all, and
+-- poll_hz is filled offline with the service key, which does not need a grant.
 revoke update on public.sessions from authenticated;
-grant update (ended_at, poll_hz) on public.sessions to authenticated;
 
 -- Column-level insert grant. RLS gates which ROWS you may insert, never which
 -- COLUMNS — the insert policy above passes for any value of any column. So
--- started_at (server clock) and ended_at/poll_hz (close-time only) would be
+-- started_at (server clock) and poll_hz (service-written, offline) would be
 -- forgeable at insert despite their comments. Revoking table-level insert and
 -- granting it per column is what actually confines the client. `id` IS granted:
 -- the client mints the session uuid so a segment can be enqueued before the
@@ -929,7 +884,6 @@ select
   s.app_version,
   s.sampling_version,
   s.started_at        as session_started_at,
-  s.ended_at          as session_ended_at,
   g.segment_index,
   -- Insert time. The keyset-pagination and incremental-pull cursor; see header.
   g.created_at        as segment_created_at,

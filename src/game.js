@@ -2,7 +2,7 @@ import { Euler, Raycaster, Vector2, Vector3 } from 'three';
 import { createRoutine } from './routines/index.js';
 import { configFor } from './difficulty.js';
 import { createTelemetry, buildSegmentPayload, buildSessionPayload } from './telemetry.js';
-import { insertSession, insertSegment, closeSession } from './supabase.js';
+import { insertSession, insertSegment } from './supabase.js';
 import {
   FEEDBACK_FLASH_MS,
   TRACK_WINDOW_MS,
@@ -488,11 +488,6 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
         ...(options.session ?? {})
       });
 
-      // Opens the session-scoped poll_hz histogram. Must be per RUN, not per
-      // segment — a per-segment median would be taken over about a second of
-      // samples and the run's figure would end up a median of medians.
-      telemetry.beginSession();
-
       hits = 0;
       attempts = 0;
       clicks = 0;
@@ -583,16 +578,10 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
         );
         pendingSession = null;
         pendingSegments = [];
-      } else {
-        // Close the row: the one update the client may make. Fire-and-forget —
-        // closeSession logs its own failure and the offline backfill covers it,
-        // so there is nothing useful to await here. poll_hz comes from the
-        // session-wide histogram and is null if too few samples were seen.
-        closeSession(currentSessionId, {
-          endedAt: new Date().toISOString(),
-          pollHz: telemetry.pollHz()
-        });
       }
+      // A released run needs nothing here: its row was inserted at
+      // releaseSession() and is append-only. poll_hz is derived offline (the
+      // client no longer closes the row), and ended_at no longer exists.
 
       const saved = sessionReleased;
       currentSessionId = null;

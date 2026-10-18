@@ -114,34 +114,25 @@ group by a.session_id, a.archived_at, a.segment_count
 order by a.archived_at desc;
 
 -- ===========================================================================
--- 5. BACKFILL ended_at / poll_hz  — safety net for a close that did not land
+-- 5. DERIVE poll_hz  — the primary fill for a service-written column
 -- ===========================================================================
--- The client closes its own session row at run end (ended_at + poll_hz, through
--- the single-shot `sessions close own` policy). If that one request is lost to
--- a network blip or a hard crash, the columns stay null and these two UPDATEs
--- recompute them from the segments that DID arrive. Both are idempotent (the
--- `is null` guard) and safe to run any time; run them before an archive pass so
--- the archived sessions carry the values.
-
--- 5a. ended_at, from the last segment of each session. Server-anchored
---     (started_at + active play), so it does not depend on a client clock. NOTE
---     this is active-play end, not wall-clock end — the same figure the client
---     would have written, minus paused spans, which are not recorded anywhere.
-update public.sessions s
-   set ended_at = s.started_at
-                + make_interval(secs => (t.ms / 1000.0)::double precision)
-  from (select session_id, max(started_at_ms + coalesce(duration_ms, 0)) as ms
-          from public.segments group by 1) t
- where t.session_id = s.id
-   and s.ended_at is null;
-
--- 5b. poll_hz, as the median pointer inter-arrival. input_events.dt is in TENTHS
---     of a millisecond and dt[0] is defined as 0, so ordinality > 1 skips that
---     leading zero and hz = 10000 / dt_tenths. This matches telemetry.js pollHz
---     exactly — median, so one backgrounded-tab gap cannot drag it down.
+-- poll_hz is not written by the client (sessions is append-only, no update
+-- path). It is derived HERE with the service key, and the archive job computes
+-- the same value for free since it already decodes every segment's
+-- input_events. Run this before an archive pass / before training so the rows
+-- carry it. Idempotent (the `is null` guard); safe to run any time.
 --
---     HEAVY: reads input_events for every segment, which means the whole TOAST
---     table. Run it on the un-archived tail only, and expect it to take a while.
+-- The median pointer inter-arrival: input_events.dt is in TENTHS of a
+-- millisecond and dt[0] is defined as 0, so ordinality > 1 skips that leading
+-- zero and hz = 10000 / dt_tenths. Median, so one backgrounded-tab gap cannot
+-- drag it down.
+--
+-- HEAVY: reads input_events for every segment, which means the whole TOAST
+-- table. Run it on the un-archived tail only, and expect it to take a while.
+--
+-- (There is no ended_at backfill — the column was dropped on 2026-10-18.
+-- Active-play duration, if ever needed, is max(started_at_ms + duration_ms)
+-- over a session's segments, derivable on demand without storing it.)
 update public.sessions s
    set poll_hz = m.hz
   from (

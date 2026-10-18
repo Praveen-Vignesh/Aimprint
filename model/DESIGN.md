@@ -77,8 +77,10 @@ For the tail it pages through **`v_training_segments`**, and two properties are 
 
 The view emits `subject_id` (one subject row is one identity — duplicate merging was removed, so
 there is no collapse step) plus `duration_ms`, runs `security_invoker`, and also carries `segment_created_at`,
-`session_ended_at`, `subject_kind_source`, `subject_cohort` and `subject_labeled_at`.
-(There is no `subject_consent_version` — the consent system was removed 2026-10-18.)
+`subject_kind_source`, `subject_cohort` and `subject_labeled_at`. (There is no
+`session_ended_at` — the `ended_at` column was dropped 2026-10-18 — and no
+`subject_consent_version` — consent was removed the same day. `poll_hz` is still present but is
+derived offline; the archive job computes it since it already decodes every segment.)
 
 **Decoding (`sampling_version = 1`):** `input_events` is delta-encoded as `{t0, dt, dx, dy}` in
 tenths of a millisecond (reconstruct `t_ms = (t0 + cumsum(dt)) / 10` with an **integer** cumsum),

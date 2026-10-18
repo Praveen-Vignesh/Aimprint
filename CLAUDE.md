@@ -127,7 +127,8 @@ in `game.js` means no routine needs to know pausing exists.
 **A run reaching `SESSION_COMPLETE_FRACTION` (70%) of its planned duration counts as
 completed** — but the client cannot record that. There is no update policy on `sessions`, so
 the client stamps *intent* (`planned_duration_ms`) at insert and the verdict is **derived
-offline**, exactly as `ended_at` is. The results screen shows a live figure as *progress*,
+offline** from segment timing (`max(started_at_ms + duration_ms)` vs `planned_duration_ms`).
+The results screen shows a live figure as *progress*,
 never as a saved record, and persists it nowhere: the offline number is computed from
 delivered segments and legitimately differs (a segment still sitting in the outbox is not
 yet a delivered row).
@@ -405,9 +406,8 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   columns the client legitimately writes (RLS gates rows, never columns). **A new client-written
   column must be added to BOTH the payload (`telemetry.js`) and the grant.** Send a column that
   is not granted and the whole insert fails with `42501`, which `outbox.js` classifies as
-  permanent and **drops every row** — silent total loss. This is why `poll_hz`/`started_at`/
-  `ended_at` (service-written) are absent from the payload, and why `sessions.id` and
-  `segments` exclude `id`/`created_at`.
+  permanent and **drops every row** — silent total loss. This is why `poll_hz` and `started_at`
+  (service-written) are absent from the payload, and why `segments` excludes `id`/`created_at`.
 - **One subject row is one identity — there is no duplicate-merging mechanism.** `merged_into`,
   its self-reference CHECK, the `enforce_merge_depth` trigger and `subjects_merged_into_idx` were
   all **removed**. If the same person turns up on two accounts, **exclude the extra account** at
@@ -431,16 +431,17 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   `23503` forever (the outbox treats a missing session as transient on purpose). The results
   screen must surface `saved: false`, or a discarded run looks saved — the exact silent loss this
   codebase is built to avoid.
-- **`sessions.ended_at` / `poll_hz` are written by the client ONCE, at run end, through the only
-  UPDATE policy in the schema.** `closeSession()` (`supabase.js`) PATCHes the row via
-  `sessions close own`, which is single-shot by construction: `using (ended_at is null)` stops
-  matching the moment the first close lands, and a column-level `grant update (ended_at, poll_hz)`
-  is what confines the write to those two columns (RLS cannot restrict columns). `ended_at` is a
-  client wall-clock and therefore forgeable — accepted because it is descriptive, never a model
-  feature, and `sessions_ended_at_sane` catches a broken one. `poll_hz` is the median pointer
-  inter-arrival measured in `telemetry.js` (`pollHz`), null below `POLL_MIN_SAMPLES`. Neither is
-  in the INSERT grant or the session payload — sending either at insert is a `42501` that drops
-  the whole row. If a close is lost, `queries/campaign.sql` §5 backfills both.
+- **The client never updates a session row. `poll_hz` is service-written offline; `ended_at`
+  does not exist.** Both were briefly client-written at run end through a single-shot
+  `sessions close own` UPDATE policy; that policy and the `ended_at` column were removed on
+  2026-10-18 (see below), restoring strictly append-only. `poll_hz` (the median pointer
+  inter-arrival) is derived with the service key by `queries/campaign.sql` §5 and the archive
+  job, which already decodes every segment — so it is null during collection and filled before
+  training. It stays out of the INSERT grant and the session payload (`poll_hz is null` is
+  checked at insert); sending it at insert is a `42501` that drops the whole row. **`ended_at`
+  was dropped because nothing consumes it** — the completion verdict and every duration come from
+  segment timing (`started_at_ms + duration_ms`) and `started_at`; its only unique part
+  (wall-clock span including pauses) is not a feature and the pause structure was never recorded.
 
 ## Supabase
 
@@ -549,9 +550,8 @@ Custom SMTP is live on `smtp.gmail.com:587` with a Gmail App Password. The built
 Supabase mailer is capped at **2 emails/hour** and is not usable for real signups; custom
 SMTP raises that to 30/hour by default (Authentication → Rate Limits). With no
 credentials or no signed-in account the game still runs and simply drops rows.
-`sessions.ended_at` and `poll_hz` are written by the client ONCE at run end through the
-single-shot `sessions close own` policy (see the invariant above); if that close is lost they
-are backfilled offline with the service key (`queries/campaign.sql` §5).
+`sessions.poll_hz` is written offline with the service key (`queries/campaign.sql` §5 / the
+archive job); the client never writes it, and `ended_at` was dropped (see the invariant above).
 
 **The v1 flat table has been dropped outright**, not merely renamed-and-ignored.
 `schema.sql` no longer renames or revokes on it, and **neither statement may be
@@ -594,15 +594,14 @@ Rules the v2 design encodes, worth preserving in any migration:
   be written back into `kind`** —
   ground truth is what a person decided; a retrain that consumes its predecessor's guesses
   amplifies its own errors.
-- **Append-only on every telemetry table, with ONE narrow exception: no delete policy
-  anywhere, and the only update policy is the single-shot `sessions close own`.** A
-  behavioural reference set the account holder can rewrite is not a reference set — so there is
-  no update policy on `subjects`, `segments`, `session_metrics` or (since consent was removed)
-  `profiles`. `sessions close own` exists only because `ended_at`/`poll_hz` cannot be known at
-  insert: `using (ended_at is null)` makes it fire at most once per row, and a column-level
-  `grant update (ended_at, poll_hz)` confines it to those two columns. Do not widen it, and do
-  not add a second update policy to any other table. (`subjects` carries **no policy at all**;
-  there are six policies in the file.)
+- **Strictly append-only: NO update policy and NO delete policy on any table.** A behavioural
+  reference set the account holder can rewrite is not a reference set, so `subjects`, `sessions`,
+  `segments`, `session_metrics` and `profiles` all have `revoke update` and no update grant — the
+  client can only insert and (where a select policy exists) read. Every service-written value
+  (`poll_hz`, the labels, `session_metrics`) is written with the service key, which bypasses RLS.
+  There was briefly one exception — a single-shot `sessions close own` for `ended_at`/`poll_hz` —
+  removed on 2026-10-18 with the `ended_at` column. **Do not reintroduce an update policy on any
+  table.** (`subjects` carries no policy at all; there are five policies in the file.)
 - **`segments` has no `select` policy at all.** Trajectories are the raw material of a
   biometric template, so an account cannot download its own reference data to replay it.
   Aggregates reach the player through `session_metrics`, and the training pull goes

@@ -68,7 +68,10 @@ Full record and the two ordering traps it exposed: `AUDIT-2026-10.md` follow-up 
 
 ## 5. ~~ended_at / poll_hz never filled~~ — RESOLVED 2026-10-18
 
-Both are now written by the client in one shot at run end (`closeSession` →
-`sessions close own` policy, `grant update (ended_at, poll_hz)`), with
-`queries/campaign.sql` §5 as the offline backfill if a close is lost. `poll_hz`
-is the median pointer inter-arrival measured in `telemetry.js` (`pollHz`).
+`ended_at` was **dropped** — nothing consumes it (completion and durations come
+from segment timing + `started_at`; its only unique part, wall-clock-with-pauses,
+is not a feature). `poll_hz` stays (hardware block) and is **derived offline**
+with the service key — `queries/campaign.sql` §5 and the archive job, which
+already decodes every segment. The client no longer writes either, so `sessions`
+is strictly append-only (no UPDATE policy). A brief client-close design
+(2026-10-18 morning) was reverted the same day.

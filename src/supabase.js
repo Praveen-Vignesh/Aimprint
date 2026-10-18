@@ -266,46 +266,12 @@ export async function validateSession() {
   await client.auth.signOut({ scope: 'local' });
 }
 
-// Closes the session row at the end of a run: the ONLY update the client is
-// permitted anywhere in this schema. `ended_at` and `poll_hz` cannot be written
-// at insert time — the row opens partway through the run, at
-// SESSION_MIN_PLAY_MS, and neither value exists until the run is over — so they
-// go through the `sessions close own` policy instead, confined to those two
-// columns by `grant update (ended_at, poll_hz)`.
-//
-// Deliberately NOT routed through the outbox. It is one tiny request per
-// session with nothing to batch, and the failure path is already covered by a
-// SQL backfill, so giving outbox.js a PATCH path would be new delivery
-// semantics bought for nothing.
-//
-// No .select(), and that is what makes it idempotent for free. PostgREST
-// answers an UPDATE matching zero rows with a plain 200 and no error — and
-// zero rows is exactly what a second attempt produces, because the policy's
-// `using (ended_at is null)` stops matching the moment the first one lands. So
-// "closed it" and "it was already closed" are indistinguishable, and both are
-// correct. The .is() filter below duplicates that policy predicate on purpose,
-// belt and braces.
-//
-// A failure is logged and dropped, never retried: section 5 of
-// queries/campaign.sql backfills both columns from the segments that did
-// arrive, so nothing is actually lost if this request never lands.
-export async function closeSession(sessionId, { endedAt, pollHz }) {
-  if (client === null || sessionId === null || sessionId === undefined) return;
-
-  const { error } = await client
-    .from('sessions')
-    .update({ ended_at: endedAt, poll_hz: pollHz })
-    .eq('id', sessionId)
-    .is('ended_at', null);
-
-  if (error) {
-    console.warn(
-      `Session ${sessionId} could not be closed (${error.code ?? 'no code'}); ` +
-        'ended_at/poll_hz will need the offline backfill:',
-      error.message
-    );
-  }
-}
+// There is no session-close path. The client writes a session row once (at
+// insert) and never updates it — the schema has no UPDATE policy on sessions.
+// `poll_hz` (the one service-written column that was briefly client-closed) is
+// derived offline with the service key: queries/campaign.sql section 5 and the
+// archive job, which already decodes every segment. `ended_at` was dropped
+// entirely on 2026-10-18.
 
 // ---------------------------------------------------------------------------
 // Telemetry delivery

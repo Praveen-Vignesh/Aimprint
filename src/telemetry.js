@@ -28,22 +28,11 @@ const POSITION_PRECISION = 1e3;
 // trajectory `t` still uses, would collapse adjacent 1 ms samples.
 const INPUT_TIME_PRECISION = 1e1;
 
-// poll_hz measurement. Pointer inter-arrival gaps are bucketed into a fixed
-// histogram indexed by the gap itself, in the same integer tenths of a
-// millisecond recordInput already rounds to — so bucket 10 is a 1 ms gap
-// (1000 Hz). 2000 buckets covers 0–200 ms, which is far beyond any real
-// polling rate, and costs one small Int32Array per session.
-//
-// A histogram rather than a running mean, because the statistic has to be the
-// MEDIAN: a backgrounded tab, an alt-tab or a GC pause produces a single
-// enormous gap, and one such outlier drags a mean down by hundreds of Hz. The
-// median is immune to a handful of them and a histogram makes it exact without
-// retaining the hundreds of thousands of individual samples a session produces.
-const POLL_HIST_LEN = 2000;
-// Below this many measured gaps the median is not worth reporting, and poll_hz
-// is left null for the offline backfill (queries/campaign.sql section 5b) to
-// fill in from the stored stream.
-const POLL_MIN_SAMPLES = 100;
+// poll_hz is NOT measured here. It is derived offline (the median pointer
+// inter-arrival from the stored input_events) by queries/campaign.sql section 5
+// and the archive job — the client has no update path to write it, and
+// sessions is append-only. The raw stream below is all the offline derivation
+// needs.
 
 function roundTo(value, precision) {
   return value === null ? null : Math.round(value * precision) / precision;
@@ -66,48 +55,7 @@ export function createTelemetry() {
   let board = [];
   let segmentStart = 0;
 
-  // poll_hz state, SESSION-scoped — createTelemetry() is constructed once per
-  // game, so these are reset by beginSession(), never by beginSegment().
-  let pollHist = null;
-  let pollSamples = 0;
-  // The previous sample's `t`, or null when the next sample must not be
-  // differenced against anything. Cleared on every segment boundary: `t` is
-  // relative to segmentStart, so a gap taken across a boundary would be the
-  // difference between two unrelated origins — a large negative number, or
-  // worse, a plausible-looking small one.
-  let lastInputT = null;
-
   return {
-    // Opens a fresh session. Resets the poll histogram, which spans the whole
-    // run rather than one segment: a per-segment median would be computed from
-    // a second of samples and the run's figure would then be a median of
-    // medians, which is not the median.
-    beginSession() {
-      pollHist = new Int32Array(POLL_HIST_LEN);
-      pollSamples = 0;
-      lastInputT = null;
-    },
-
-    // The measured pointer polling rate for the session so far, or null when
-    // too few gaps were seen to mean anything. Walks the cumulative counts to
-    // the bucket holding the median gap and converts: a gap of `g` tenths of a
-    // millisecond is 10000 / g Hz (10 tenths = 1 ms = 1000 Hz).
-    pollHz() {
-      if (pollHist === null || pollSamples < POLL_MIN_SAMPLES) return null;
-
-      const middle = pollSamples / 2;
-      let seen = 0;
-      for (let gap = 0; gap < POLL_HIST_LEN; gap++) {
-        seen += pollHist[gap];
-        if (seen < middle) continue;
-        // A zero gap means two samples rounded into the same tenth of a
-        // millisecond, which carries no rate information and would divide by
-        // zero. Treat it as unmeasurable rather than reporting Infinity.
-        return gap === 0 ? null : Math.round((10000 / gap) * 10) / 10;
-      }
-      return null;
-    },
-
     // Opens a fresh segment. New arrays are allocated rather than emptied in
     // place, because the previous segment's arrays may still be on their way to
     // Supabase. `boardSnapshot` is the layout of every live target at the start
@@ -117,9 +65,6 @@ export function createTelemetry() {
       frames = [];
       inputs = [];
       board = boardSnapshot;
-      // See lastInputT above: `t` is segment-relative, so the first sample of a
-      // new segment has nothing valid to be differenced against.
-      lastInputT = null;
     },
 
     // One sample per rendered frame. `dx`/`dy` are the raw device counts since
@@ -149,20 +94,7 @@ export function createTelemetry() {
     // exact (round-then-delta, never delta-then-round).
     recordInput(eventTime, dx, dy) {
       const t = Math.round((eventTime - segmentStart) * INPUT_TIME_PRECISION);
-
       inputs.push({ t, dx, dy });
-
-      // Bucket the inter-arrival gap for poll_hz. Out-of-range gaps (a tab that
-      // was backgrounded for a minute) are dropped rather than clamped into the
-      // top bucket, which would pull the median toward a rate nobody has.
-      if (pollHist !== null && lastInputT !== null) {
-        const gap = t - lastInputT;
-        if (gap >= 0 && gap < POLL_HIST_LEN) {
-          pollHist[gap]++;
-          pollSamples++;
-        }
-      }
-      lastInputT = t;
     },
 
     frames() {
@@ -263,14 +195,13 @@ function inputsToColumnar(inputs) {
 // profile, and `id` is minted by game.js so segments can be enqueued against it
 // before the session insert resolves.
 //
-// ended_at and poll_hz are DELIBERATELY NOT in this payload, even though the
-// client now writes both. They are written at CLOSE time, by closeSession() in
-// supabase.js, through a separate one-shot UPDATE policy — and the column-level
-// INSERT grant in schema.sql excludes them, so naming either here (even as
-// null) makes PostgREST reject the whole insert with 42501, which the outbox
-// classifies as permanent and DROPS. Every session would silently vanish.
-// started_at is excluded for the same mechanical reason and is server-stamped.
-// Do not add any of the three back here.
+// poll_hz and started_at are DELIBERATELY NOT in this payload. poll_hz is
+// service-written offline (the client has no write path for it at all), and
+// started_at is the server clock — both are excluded from the column-level
+// INSERT grant in schema.sql, so naming either here (even as null) makes
+// PostgREST reject the whole insert with 42501, which the outbox classifies as
+// permanent and DROPS. Every session would silently vanish. Do not add them
+// back. (There is no ended_at — the column was dropped on 2026-10-18.)
 export function buildSessionPayload({
   id = undefined,
   routine,
