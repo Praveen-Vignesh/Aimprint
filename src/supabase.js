@@ -4,6 +4,38 @@ import { createOutbox, createIdbStore } from './outbox.js';
 const url = import.meta.env.VITE_SUPABASE_URL;
 const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
+// "Remember me": supabase-js has no per-sign-in persistence option, only a
+// fixed storage backend set at client construction. This adapter picks that
+// backend per call instead, from a flag written just before signIn/signUp/
+// signInWithGoogle — localStorage (the prior, unconditional behaviour) unless
+// the player unchecked "remember me", in which case the session lands in
+// sessionStorage and disappears when the tab closes. Unset (new visitor,
+// or the bot driver, which never touches the checkbox) reads as remembered,
+// so the default behaviour is unchanged.
+const REMEMBER_KEY = 'aim-trainer.remember';
+
+function rememberedStorage() {
+  try {
+    return localStorage.getItem(REMEMBER_KEY) === '0' ? sessionStorage : localStorage;
+  } catch {
+    return localStorage;
+  }
+}
+
+const dynamicStorage = {
+  getItem: (key) => rememberedStorage().getItem(key),
+  setItem: (key, value) => rememberedStorage().setItem(key, value),
+  removeItem: (key) => rememberedStorage().removeItem(key)
+};
+
+export function setRememberMe(remember) {
+  try {
+    localStorage.setItem(REMEMBER_KEY, remember ? '1' : '0');
+  } catch {
+    // Private mode / quota — falls back to the always-persisted default.
+  }
+}
+
 // Without credentials the trainer still runs; rows are simply dropped.
 const client =
   url && anonKey
@@ -11,8 +43,14 @@ const client =
         // detectSessionInUrl handles the Google OAuth redirect back to the app:
         // supabase-js reads the code/tokens Google appended to the URL, exchanges
         // them for a session, then strips them from the URL. A no-op for the
-        // email/password path, whose URLs never carry those params.
-        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+        // email/password path, whose URLs never carry those params. The same
+        // mechanism is what detects a password-recovery link's return trip.
+        auth: {
+          persistSession: true,
+          autoRefreshToken: true,
+          detectSessionInUrl: true,
+          storage: dynamicStorage
+        }
       })
     : null;
 
@@ -47,17 +85,23 @@ function currentOwner() {
   return currentUserId;
 }
 
-// { status: 'loading' | 'signed_in' | 'signed_out', email, userId }
+// { status: 'loading' | 'signed_in' | 'signed_out', email, userId, isRecovery }
 //
 // There is no `consented` field any more. The consent system — both column
 // pairs, the version constant, the mirror trigger and the gate that read
 // them — was removed on 2026-10-18. Agreement is now part of creating an
 // account, stated on the sign-up card, with nothing to record or re-check at
 // runtime. Playing requires a signed-in account and nothing else.
+//
+// `isRecovery` is true for the session a password-reset link hands back —
+// that session is real (status is still 'signed_in'), but the caller must
+// treat it as "needs a new password", not "ready to play": landing.js checks
+// it to hold the player on the reset form instead of redirecting to /play.
 let currentAuth = {
   status: client === null ? 'signed_out' : 'loading',
   email: null,
-  userId: null
+  userId: null,
+  isRecovery: false
 };
 const authListeners = new Set();
 
@@ -84,7 +128,7 @@ function notifyAuth() {
 if (client !== null) {
   // Fires INITIAL_SESSION on subscribe (supabase-js v2), so currentAuth leaves
   // 'loading' as soon as the persisted session is read from localStorage.
-  client.auth.onAuthStateChange((_event, session) => {
+  client.auth.onAuthStateChange((event, session) => {
     accessToken = session?.access_token ?? null;
     currentUserId = session?.user?.id ?? null;
 
@@ -106,7 +150,8 @@ if (client !== null) {
       currentAuth = {
         status: 'signed_in',
         email: session.user.email ?? null,
-        userId: session.user.id
+        userId: session.user.id,
+        isRecovery: event === 'PASSWORD_RECOVERY'
       };
       notifyAuth();
       // This account is now the current owner, so any rows held for it (from a
@@ -123,7 +168,7 @@ if (client !== null) {
     }
 
     subjectPromise = null;
-    currentAuth = { status: 'signed_out', email: null, userId: null };
+    currentAuth = { status: 'signed_out', email: null, userId: null, isRecovery: false };
     notifyAuth();
   });
 }
@@ -191,9 +236,17 @@ function ensureAuth() {
 
 // Returns {} on success, { error } (a message) on failure, or { needsConfirmation:true }
 // when the project requires email confirmation and no session was issued yet.
-export async function signUp({ email, password }) {
+// `fullName` has no column anywhere (subjects/profiles carry no name field),
+// so it is stored only as Supabase auth user_metadata — a schema-free,
+// optional label on the account, never training data.
+export async function signUp({ email, password, fullName }) {
   if (client === null) return { error: 'Supabase is not configured.' };
-  const { data, error } = await client.auth.signUp({ email, password });
+  const trimmedName = typeof fullName === 'string' ? fullName.trim() : '';
+  const { data, error } = await client.auth.signUp({
+    email,
+    password,
+    options: trimmedName === '' ? undefined : { data: { full_name: trimmedName } }
+  });
   if (error) return { error: error.message };
 
   // With "Confirm email" ON, Supabase does NOT reject a signup for an address
@@ -237,6 +290,32 @@ export async function signInWithGoogle() {
 export async function signOut() {
   if (client === null) return;
   await client.auth.signOut();
+}
+
+// Sends the reset-password email. `redirectTo` is the bare origin, same as
+// signInWithGoogle — there is no dedicated reset page (this is a static,
+// three-entry build with no router), so the link lands back on `/` and
+// detectSessionInUrl turns it into a PASSWORD_RECOVERY auth event there.
+export async function requestPasswordReset(email) {
+  if (client === null) return { error: 'Supabase is not configured.' };
+  const { error } = await client.auth.resetPasswordForEmail(email, {
+    redirectTo: window.location.origin
+  });
+  if (error) return { error: error.message };
+  return {};
+}
+
+// Finishes the recovery flow started by requestPasswordReset: called while
+// the recovery session (isRecovery: true) is active. Clears the flag on
+// success so the caller's next render treats the account as a normal
+// signed-in session rather than still "mid reset".
+export async function updatePassword(newPassword) {
+  if (client === null) return { error: 'Supabase is not configured.' };
+  const { error } = await client.auth.updateUser({ password: newPassword });
+  if (error) return { error: error.message };
+  currentAuth = { ...currentAuth, isRecovery: false };
+  notifyAuth();
+  return {};
 }
 
 // supabase-js restores the persisted session from localStorage and emits

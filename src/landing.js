@@ -8,7 +8,10 @@ import {
   signUp,
   signOut,
   signInWithGoogle,
-  validateSession
+  validateSession,
+  setRememberMe,
+  requestPasswordReset,
+  updatePassword
 } from './supabase.js';
 import { createAuthPanel } from './ui/auth-panel.js';
 
@@ -23,14 +26,26 @@ if (root !== null) {
       onSignIn({ email, password }) {
         return signIn({ email, password });
       },
-      onSignUp({ email, password }) {
-        return signUp({ email, password });
+      onSignUp({ email, password, fullName }) {
+        return signUp({ email, password, fullName });
       },
       onSignOut() {
         return signOut();
       },
       onGoogleSignIn() {
         return signInWithGoogle();
+      },
+      // Set just before the sign-in/sign-up/Google call it governs: supabase.js
+      // reads this flag the moment it next writes a session, picking
+      // localStorage (remembered) or sessionStorage (forgotten on tab close).
+      onRememberMe(remember) {
+        setRememberMe(remember);
+      },
+      onRequestReset(email) {
+        return requestPasswordReset(email);
+      },
+      onUpdatePassword(password) {
+        return updatePassword(password);
       }
     },
     // Fires only on the TRANSITION into signed in, so finishing the form
@@ -93,7 +108,15 @@ if (root !== null) {
 
   onAuthChange((state) => {
     panel.render(state);
-    ready = state.status === 'signed_in';
+    ready = state.status === 'signed_in' && state.isRecovery !== true;
+
+    // A password-reset link lands here with a real (recovery) session already
+    // active — open the modal straight to the "set a new password" view
+    // rather than waiting for the player to find the "Start training" button.
+    if (state.isRecovery === true && modal.open === false) {
+      modal.showModal();
+      setModalOpen(true);
+    }
   });
 
   // supabase-js trusts the session it restores from localStorage without asking

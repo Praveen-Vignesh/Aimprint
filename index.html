@@ -402,8 +402,16 @@
       margin-bottom: 7px;
     }
 
+    /* A plate can hold just an input (email, full name) or an input plus the
+       eye toggle (password, confirm password) — the border/background/focus
+       ring live on the plate itself so either shape looks identical. */
     .plate {
       position: relative;
+      display: flex;
+      align-items: center;
+      background: var(--range);
+      border: 1px solid var(--line);
+      transition: border-color 140ms ease;
     }
 
     .plate::before {
@@ -418,19 +426,23 @@
       transition: height 140ms ease;
     }
 
+    .plate:focus-within {
+      border-color: var(--target);
+    }
+
     .plate:focus-within::before {
       height: 18px;
     }
 
     .plate input {
+      flex: 1;
       width: 100%;
       font: inherit;
       font-size: 15px;
       padding: 12px 14px;
-      background: var(--range);
-      border: 1px solid var(--line);
+      background: none;
+      border: 0;
       color: var(--chalk);
-      transition: border-color 140ms ease;
     }
 
     .plate input::placeholder {
@@ -439,7 +451,6 @@
 
     .plate input:focus {
       outline: none;
-      border-color: var(--target);
     }
 
     .fine {
@@ -557,6 +568,161 @@
 
     .msg.error {
       color: var(--target);
+    }
+
+    /* ----------------------------------------------------------- field error
+       Inline, under one specific input — distinct from .msg, which is the
+       shared banner for whole-form/server-side results. */
+    .field-error {
+      margin-top: 6px;
+      font-size: 12.5px;
+      line-height: 1.4;
+      color: var(--target);
+      min-height: 1px;
+    }
+
+    /* --------------------------------------------------------------- tabs
+       Sign in / Create account. Pure progressive disclosure — see the long
+       comment at the top of src/ui/auth-panel.js for why this never hides
+       either action button. */
+    .tabs {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .tab {
+      font: inherit;
+      font-size: 14px;
+      font-weight: 600;
+      background: none;
+      border: 0;
+      padding: 8px 2px 10px;
+      margin-right: 18px;
+      color: var(--chalk-faint);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: color 140ms ease, border-color 140ms ease;
+    }
+
+    .tab:hover {
+      color: var(--chalk-dim);
+    }
+
+    .tab.active {
+      color: var(--chalk);
+      border-bottom-color: var(--target);
+    }
+
+    /* ------------------------------------------------------- password field
+       The visibility toggle sits inside the plate, to the right of the input
+       (see the restyled .plate rules above). */
+    .eye {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: none;
+      border: 0;
+      padding: 0 12px;
+      color: var(--chalk-faint);
+      cursor: pointer;
+    }
+
+    .eye:hover {
+      color: var(--chalk-dim);
+    }
+
+    /* ----------------------------------------------------------- strength
+       A thin segmented bar under the sign-up password field. Score goes from
+       the strengthOf() heuristic in auth-panel.js via data-score (0-4). */
+    .strength {
+      margin-top: 8px;
+    }
+
+    .strength-bar {
+      display: flex;
+      gap: 3px;
+      height: 3px;
+      margin-bottom: 5px;
+    }
+
+    .strength-bar span {
+      flex: 1;
+      background: var(--line);
+      transition: background 140ms ease;
+    }
+
+    .strength[data-score="1"] .strength-bar span:nth-child(1) { background: var(--target); }
+    .strength[data-score="2"] .strength-bar span:nth-child(-n+2) { background: #e0a93d; }
+    .strength[data-score="3"] .strength-bar span:nth-child(-n+3) { background: #d8d13a; }
+    .strength[data-score="4"] .strength-bar span { background: #5fbf6e; }
+
+    .strength-label {
+      font-size: 12px;
+      color: var(--chalk-faint);
+    }
+
+    /* ----------------------------------------------------- remember / forgot */
+    .signin-extra {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 2px 0 15px;
+      font-size: 13px;
+    }
+
+    .remember-row {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--chalk-dim);
+    }
+
+    .remember-row input {
+      accent-color: var(--target);
+    }
+
+    .link-btn {
+      font: inherit;
+      font-size: 13px;
+      background: none;
+      border: 0;
+      padding: 0;
+      color: var(--chalk-faint);
+      cursor: pointer;
+      text-decoration: underline;
+    }
+
+    .link-btn:hover {
+      color: var(--chalk-dim);
+    }
+
+    /* -------------------------------------------------------------- busy
+       A button's own label switches to a progress string and gets this
+       class (auth-panel.js) only on the one button whose click started the
+       request — the sibling buttons are merely :disabled, with no spinner. */
+    .btn:disabled {
+      cursor: default;
+      opacity: 0.85;
+    }
+
+    .btn.busy::after {
+      content: "";
+      position: absolute;
+      right: 14px;
+      top: 50%;
+      width: 13px;
+      height: 13px;
+      margin-top: -7px;
+      border: 2px solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+      animation: btn-spin 0.6s linear infinite;
+    }
+
+    @keyframes btn-spin {
+      to { transform: rotate(360deg); }
     }
 
     .btn-block {
@@ -940,53 +1106,136 @@
       </div>
 
       <div id="auth-panel">
-        <!-- Three mutually exclusive blocks. ui/auth-panel.js finds every control
-             below by its data-auth name, scoped to #auth-panel, and toggles which
-             block is visible. Renaming or dropping a data-auth value throws at
-             page load with the missing name, rather than failing on click. -->
+        <!-- Two mutually exclusive top-level blocks (signed-out / signed-in).
+             ui/auth-panel.js finds every control below by its data-auth name,
+             scoped to #auth-panel, and toggles which block — and, inside
+             signed-out, which of the three views — is visible. Renaming or
+             dropping a data-auth value throws at page load with the missing
+             name, rather than failing on click. "email" / "password" /
+             "signin" also keep their exact names and behaviour because
+             bot_driver/src/run.js drives them directly by selector. -->
 
         <div data-auth="signed-out">
-          <button class="btn btn-google" data-auth="google">
-            <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
-              <path fill="#4285F4"
-                d="M23 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.2a5.3 5.3 0 0 1-2.3 3.5v2.9h3.7c2.2-2 3.4-5 3.4-8.6z" />
-              <path fill="#34A853"
-                d="M12 24c3.1 0 5.7-1 7.6-2.8l-3.7-2.9c-1 .7-2.3 1.1-3.9 1.1-3 0-5.5-2-6.4-4.7H1.8v3C3.7 21.4 7.6 24 12 24z" />
-              <path fill="#FBBC05" d="M5.6 14.7a7.2 7.2 0 0 1 0-4.6v-3H1.8a12 12 0 0 0 0 10.6l3.8-3z" />
-              <path fill="#EA4335"
-                d="M12 4.8c1.7 0 3.2.6 4.4 1.7l3.2-3.2C17.7 1.5 15.1.4 12 .4 7.6.4 3.7 3 1.8 6.8l3.8 3c.9-2.8 3.4-4.8 6.4-4.8z" />
-            </svg>
-            Continue with Google
-          </button>
+          <div data-auth="view-form">
+            <div class="tabs" role="tablist">
+              <button type="button" class="tab" role="tab" data-auth="tab-signin">Sign in</button>
+              <button type="button" class="tab" role="tab" data-auth="tab-signup">Create account</button>
+            </div>
 
-          <div class="divider">or use an email address</div>
+            <button class="btn btn-google" data-auth="google">
+              <svg width="17" height="17" viewBox="0 0 24 24" aria-hidden="true">
+                <path fill="#4285F4"
+                  d="M23 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.2a5.3 5.3 0 0 1-2.3 3.5v2.9h3.7c2.2-2 3.4-5 3.4-8.6z" />
+                <path fill="#34A853"
+                  d="M12 24c3.1 0 5.7-1 7.6-2.8l-3.7-2.9c-1 .7-2.3 1.1-3.9 1.1-3 0-5.5-2-6.4-4.7H1.8v3C3.7 21.4 7.6 24 12 24z" />
+                <path fill="#FBBC05" d="M5.6 14.7a7.2 7.2 0 0 1 0-4.6v-3H1.8a12 12 0 0 0 0 10.6l3.8-3z" />
+                <path fill="#EA4335"
+                  d="M12 4.8c1.7 0 3.2.6 4.4 1.7l3.2-3.2C17.7 1.5 15.1.4 12 .4 7.6.4 3.7 3 1.8 6.8l3.8 3c.9-2.8 3.4-4.8 6.4-4.8z" />
+              </svg>
+              Continue with Google
+            </button>
 
-          <div class="row">
-            <label for="g-email">Email</label>
-            <div class="plate">
-              <input id="g-email" data-auth="email" type="email" placeholder="you@example.com" autocomplete="email" />
+            <div class="divider">or use an email address</div>
+
+            <div class="row" data-auth="row-fullname">
+              <label for="g-name">Full name (optional)</label>
+              <div class="plate">
+                <input id="g-name" data-auth="fullname" type="text" placeholder="Jordan Lee" autocomplete="name" />
+              </div>
+            </div>
+
+            <div class="row">
+              <label for="g-email">Email</label>
+              <div class="plate">
+                <input id="g-email" data-auth="email" type="email" placeholder="you@example.com"
+                  autocomplete="email" aria-describedby="g-email-error" />
+              </div>
+              <p class="field-error" id="g-email-error" data-auth="email-error" role="alert"></p>
+            </div>
+
+            <div class="row">
+              <label for="g-pass">Password</label>
+              <div class="plate">
+                <input id="g-pass" data-auth="password" type="password" placeholder="At least 6 characters"
+                  autocomplete="current-password" aria-describedby="g-pass-error" />
+                <button type="button" class="eye" data-auth="password-toggle"></button>
+              </div>
+              <p class="field-error" id="g-pass-error" data-auth="password-error" role="alert"></p>
+              <div class="strength" data-auth="row-strength">
+                <div class="strength-bar">
+                  <span></span><span></span><span></span><span></span>
+                </div>
+                <span class="strength-label" data-auth="strength"></span>
+              </div>
+            </div>
+
+            <div class="row" data-auth="row-confirm-password">
+              <label for="g-pass2">Confirm password</label>
+              <div class="plate">
+                <input id="g-pass2" data-auth="confirm-password" type="password" placeholder="Retype your password"
+                  autocomplete="new-password" aria-describedby="g-pass2-error" />
+                <button type="button" class="eye" data-auth="confirm-password-toggle"></button>
+              </div>
+              <p class="field-error" id="g-pass2-error" data-auth="confirm-password-error" role="alert"></p>
+            </div>
+
+            <div class="signin-extra" data-auth="row-signin-extra">
+              <label class="remember-row">
+                <input type="checkbox" data-auth="remember" checked />
+                Remember me
+              </label>
+              <button type="button" class="link-btn" data-auth="forgot">Forgot password?</button>
+            </div>
+
+            <div class="auth-actions">
+              <button class="btn btn-ghost" data-auth="signin">Sign in</button>
+              <button class="btn btn-primary" data-auth="signup">Create account</button>
+            </div>
+
+            <p class="msg" data-auth="message" role="alert"></p>
+
+            <p class="fine">Creating an account means your mouse movement during training is
+              recorded for this research. <a href="/privacy">What gets recorded</a>. One email
+              to confirm your address — we will only write again to invite you back for
+              another session.</p>
+          </div>
+
+          <div data-auth="view-reset-request">
+            <p class="card-head">Reset your password</p>
+            <div class="row">
+              <label for="g-reset-email">Email</label>
+              <div class="plate">
+                <input id="g-reset-email" data-auth="reset-email" type="email" placeholder="you@example.com"
+                  autocomplete="email" aria-describedby="g-reset-email-error" />
+              </div>
+              <p class="field-error" id="g-reset-email-error" data-auth="reset-error" role="alert"></p>
+            </div>
+            <div class="auth-actions">
+              <button class="btn btn-ghost" data-auth="back-to-signin">Back</button>
+              <button class="btn btn-primary" data-auth="reset-request-submit">Send reset link</button>
             </div>
           </div>
 
-          <div class="row">
-            <label for="g-pass">Password</label>
-            <div class="plate">
-              <input id="g-pass" data-auth="password" type="password" placeholder="At least 6 characters"
-                autocomplete="current-password" />
+          <div data-auth="view-reset-new">
+            <p class="card-head">Choose a new password</p>
+            <div class="row">
+              <label for="g-new-pass">New password</label>
+              <div class="plate">
+                <input id="g-new-pass" data-auth="new-password" type="password" placeholder="At least 6 characters"
+                  autocomplete="new-password" aria-describedby="g-new-pass-error" />
+              </div>
             </div>
+            <div class="row">
+              <label for="g-new-pass2">Confirm new password</label>
+              <div class="plate">
+                <input id="g-new-pass2" data-auth="confirm-new-password" type="password"
+                  placeholder="Retype your new password" autocomplete="new-password"
+                  aria-describedby="g-new-pass-error" />
+              </div>
+              <p class="field-error" id="g-new-pass-error" data-auth="reset-new-error" role="alert"></p>
+            </div>
+            <button class="btn btn-primary btn-block" data-auth="reset-submit">Save new password</button>
           </div>
-
-          <div class="auth-actions">
-            <button class="btn btn-ghost" data-auth="signin">Sign in</button>
-            <button class="btn btn-primary" data-auth="signup">Create account</button>
-          </div>
-
-          <p class="msg" data-auth="message" role="alert"></p>
-
-          <p class="fine">Creating an account means your mouse movement during training is
-            recorded for this research. <a href="/privacy">What gets recorded</a>. One email
-            to confirm your address — we will only write again to invite you back for
-            another session.</p>
         </div>
 
         <div data-auth="signed-in">
