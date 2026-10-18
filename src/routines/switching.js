@@ -37,7 +37,7 @@ export function createSwitchingRoutine({ scene, camera, config }) {
 
   return {
     kind: 'destructible',
-    // Targets move, so per-frame tx/ty/tz is kept (see sampling_version 4).
+    // Targets move, so per-frame tx/ty/tz is kept (see sampling_version 1).
     movesTargets: true,
     targets: pool.active,
     // NOTE: this routine used to set `tracksBoardTrajectory: true`, which

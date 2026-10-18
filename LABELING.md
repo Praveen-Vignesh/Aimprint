@@ -1,14 +1,24 @@
 # Label integrity — `subjects.kind` is default-deny
 
-> ## STATUS — schema applied from scratch on a wiped database 2026-10-18
+> ## STATUS — schema applied from scratch, live parity CONFIRMED 2026-10-18
 > **The label fix is live by construction. §5.6 (labelling the batches) is the
-> only step that remains, and it cannot start before recruitment.**
+> only manual step that remains, and it cannot start before recruitment.**
 > This block is the single place in the repo that answers "is the label fix
 > actually live". Keep it current by hand.
 >
-> On 2026-10-18 all collected telemetry was deleted and `schema.sql` was
-> rewritten as one from-scratch DDL file (it is no longer an idempotent
-> migration — see its header) and applied clean in one buffer. Everything the
+> ✅ **Live parity confirmed 2026-10-18** via `queries/schema_parity.sql` +
+> dashboard: all collected telemetry was wiped (teardown) and `schema.sql` was
+> re-applied as one buffer. Verified against the live DB — columns match exactly
+> (contiguous ordinals = fresh create, not migrated); 2 functions
+> (`handle_new_user`, `current_subject_id`); 5 policies, 0 UPDATE/0 DELETE;
+> 12 indexes; the `on_auth_user_created` trigger on `auth.users` (0 triggers on
+> public, as expected). No `ended_at`, no consent columns, no merge machinery;
+> `archive_manifest.subject_id` (not `raw_subject_id`). Re-run that script if the
+> DB is ever restored from a backup predating this date.
+>
+> On 2026-10-18 all collected telemetry was deleted and `schema.sql` (rewritten
+> as one from-scratch DDL file — no longer an idempotent migration, see its
+> header) was applied in one buffer. Everything the
 > old STATUS block and its addenda tracked step by step is now simply **how the
 > tables are defined**, so there is nothing left to "roll out":
 >

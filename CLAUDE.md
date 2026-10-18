@@ -61,8 +61,9 @@ Adding a dependency or a framework *there* is a spec violation, not an improveme
 - The in-browser Bot Mode has been **removed entirely** — no `?bot=`, no `bot.js`.
 
 **Database (`schema.sql`) — the v2 shape, plus a label-integrity fix layered on top:**
-- Five tables (`subjects`, `profiles`, `sessions`, `segments`, `session_metrics`) plus the
-  `v_training_segments` view, RLS on every client-facing table, append-only by design.
+- Six tables (`subjects`, `profiles`, `sessions`, `segments`, `session_metrics`,
+  `archive_manifest`) plus the `v_training_segments` view, RLS on every client-facing table,
+  append-only by design.
 - **`subjects.kind` is default-deny** (`'unknown'` by default, not `'human'`), with a
   provenance constraint and a three-valued label in the training view. This was a real
   bug — every signup used to enter the training set as a verified human. Documented in
@@ -294,10 +295,8 @@ disagrees with `sitemap.xml`. If the hostname ever changes again, those tags and
 `rollupOptions.input` — it is a 1200×630 template used to regenerate `public/og-image.png`
 by screenshot, not a shipped page.
 
-`design/` holds `landing-d-readout.html` and `landing-gaming.html`: **design prototypes,
-not build inputs.** They say so in their own headers, are absent from `rollupOptions.input`
-and from `dist/`, and are reachable only via `npm run dev` at `/design/*.html`. Nothing
-imports them and they may be deleted freely.
+(The `design/` folder of landing prototypes was deleted on 2026-10-18 once the live landing
+design was settled — it was never a build input and nothing imported it.)
 
 ### The other markdown in this repo
 
@@ -314,7 +313,7 @@ All of it is current; read it rather than re-deriving:
   bot-detector / biometric-identification training protocols.
 - **`AUDIT-2026-10.md`** — the pre-collection hardening audit: every problem found before data
   collection, its fix, and the files changed (plus accepted risks and known-remaining items).
-- **`STORAGE.md`** — the storage model: the `sampling_version` 4 shrink and the Free-tier
+- **`STORAGE.md`** — the storage model: the `sampling_version` 1 shrink and the Free-tier
   archive-then-prune design with its operating rules.
 - **`queries/campaign.sql`** — read-only operator queries for the campaign (per-subject progress,
   database size against the archive trigger, ingest-health checks).
@@ -489,7 +488,7 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   postmortem — read it before touching this.**
 - `src/telemetry.js` builds two payloads (`buildSessionPayload`, `buildSegmentPayload`)
   and stores streams **columnar** (parallel arrays keyed by field name): `trajectory`
-  (per rendered frame; `tx/ty/tz` omitted for static-target routines — `sampling_version` 4),
+  (per rendered frame; `tx/ty/tz` omitted for static-target routines — `sampling_version` 1),
   and `input_events` (**delta-encoded `{t0, dt, dx, dy}`** in tenths of a millisecond, one entry
   per raw pointer sample). Each segment also carries `duration_ms` (lifted from the
   trajectory tail). `buildSessionPayload` must **not** emit `poll_hz` (service-written, not in the

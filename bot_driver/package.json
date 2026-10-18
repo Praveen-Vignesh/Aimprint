@@ -1,0 +1,14 @@
+{
+  "name": "aimprint-bot-driver",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Synthetic-data generator: drives the real Aimprint game in a real browser to produce labelled bot telemetry. Not part of the shipped app (nothing in src/ imports it) and not part of model/ (it generates data, it does not consume it).",
+  "scripts": {
+    "bot": "node src/run.js"
+  },
+  "dependencies": {
+    "playwright": "1.49.1",
+    "pngjs": "7.0.0"
+  }
+}

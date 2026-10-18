@@ -11,6 +11,45 @@ This document records the design decisions already made, so whoever builds it im
 them consistently rather than re-deriving them. **Nothing below is code you can run
 today.** Do not cite a `model/src/*.py` file as if it exists.
 
+## Before you start: readiness + the one contract that must not drift
+
+Checked 2026-10-18, before real collection begins.
+
+**Ready (the database side is done):**
+- `v_training_segments` is the pull surface — it joins the live label in, so no hand-joins.
+- `requirements.txt` and `.env.example` are complete (`SUPABASE_URL` = bare origin, no
+  `/rest/v1`; `SUPABASE_SERVICE_KEY` = the service_role key — it is what bypasses the missing
+  `segments` select policy).
+- First confirm the live schema actually matches `schema.sql` by running
+  `queries/schema_parity.sql` (the file is one-shot create-from-scratch; the live DB may lag).
+
+**You build (none of it exists):** `codec.py`, `fetch_telemetry.py`, `features.py`, the training
+scripts, and — first — `archive_telemetry.py`. All of `model/` is yours to write.
+
+**THE ONE CONTRACT THAT MUST NOT DRIFT — the v1 decoder.** It must reproduce what
+`src/telemetry.js` encoded, bit-for-bit. Get it subtly wrong and every feature is silently
+corrupted against data that cannot be re-collected. The contract:
+- `input_events` is `{t0, dt[], dx[], dy[]}` in integer **tenths of a millisecond**, `dt[0] = 0`.
+  Reconstruct absolute ms as `t_ms = (t0 + cumsum(dt)) / 10` using an **integer** cumsum — a
+  float cumsum over hundreds of terms drifts. `len(dt) == event_count` exactly.
+- `trajectory` **omits `tx/ty/tz` for static-target routines** (flick, spidershot). Fill those
+  three from `targets[engaged_index]` (constant within the segment). Only `strafing` (and the
+  withheld `switching`) carry per-frame `tx/ty/tz`.
+- Everything is `sampling_version = 1`. There is no older shape in the database, but still
+  **filter on `sampling_version`** in every pull rather than assuming.
+- **Guard it with a JS→Python round-trip test**: encode a known stream through the Node harness
+  (the one in the scratchpad that drives `telemetry.js`), decode in Python, assert bit-exact
+  including the integer cumsum. This test is the whole safety margin.
+
+**Gotchas that bite (each is elaborated in its section below):** filter the label with
+`subject_kind in ('human','synthetic')`, never `is_human is not null` (non-sargable CASE);
+`is_human` is three-valued — drop NULL before fitting, never impute; page with **keyset** on
+`(segment_created_at, segment_id)`, never LIMIT/OFFSET; **lag the watermark** 1 h on incremental
+pulls; split by `subject_id` with **GroupKFold**, never by row; the authoritative dataset is
+`archive_manifest ⋈ subjects` (Parquet) **∪** the un-archived `v_training_segments` tail; and
+run `queries/campaign.sql` §5 to populate `poll_hz` (NULL until then) before training if you want
+it in the hardware block.
+
 ## What this is
 
 An offline Python program that pulls telemetry back out of Supabase and trains a

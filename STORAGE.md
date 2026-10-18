@@ -65,6 +65,23 @@ Browser ──(outbox, ingest path unchanged)──► Postgres segments   (stag
 Never pruned: subjects, profiles, sessions, session_metrics, archive_manifest
 ```
 
+**What runs this, and what "automatic" can mean (read this before expecting magic).** A hosted
+Postgres **cannot reach your local hard drive** — there is no path, no trigger, no `pg_cron`
+push that moves rows out of Supabase onto your machine. The arrows above are a **local Python
+program you run** (`model/`, service key): it pulls aged sessions, writes Parquet to the local
+drive **and** uploads to the Storage bucket, verifies, records the manifest, then deletes. The
+database is passive — it only answers the job's queries. "Automatic" therefore means a **Windows
+Task Scheduler entry** running that job on a timer on your machine; it is never the database
+doing it. **This job does not exist yet** — it is the first unbuilt piece of `model/`
+(`src/TODO.md` §1), needed around session 60 when `segments` nears ~150 MB (§4). Until then,
+`segments` simply grows and you watch it with `queries/campaign.sql` §3.
+
+The **no-data-lost guarantee** is the verify step, not a promise: the job re-reads the written
+Parquet and asserts its row count AND a `sha256` over the sorted `(session_id, segment_index)`
+pairs equal the database's **before any `DELETE`**. A mismatch aborts the prune with the data
+still in Postgres. Late outbox replays that resurface a pruned session are re-archived
+idempotently (`queries/campaign.sql` §4d). This is designed, not built — it ships with the job.
+
 Why this shape and not client-upload-to-Storage:
 
 - **The browser never touches Storage.** The bucket is private with no client policies; only the
