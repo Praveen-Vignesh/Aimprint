@@ -66,6 +66,19 @@ function finishRun() {
   if (runState === 'idle') return;
 
   runState = 'idle';
+
+  // A sens/dpi change queued while this run was live (see settings.subscribe
+  // above) is safe to apply now: the run that just ended already has its
+  // hardware snapshot baked into its session row, and nothing downstream
+  // re-reads live sensitivity state for it.
+  if (pendingSettings !== null) {
+    const state = pendingSettings;
+    pendingSettings = null;
+    sensitivity = createSensitivity({ ...state, countScale: MOUSE_COUNT_SCALE });
+    applySensitivity(controls, sensitivity);
+    home.render(state);
+  }
+
   const summary = game.end();
   flushTelemetry();
   controls.unlock();
@@ -126,7 +139,25 @@ onAuthChange((state) => {
 
 // One sensitivity value, two consumers historically; now just the player. Kept
 // as a live update so a settings change applies without a reload.
+//
+// FROZEN for the duration of a run (running or paused). sessions.dpi/sens/
+// cm_per_360 is a single snapshot taken once at game.start() (sessionInfo())
+// and never re-read — there is no update grant on those columns, and nothing
+// re-stamps them. If a sens change applied live mid-run, the yaw/pitch frames
+// recorded after it would be generated under a different dpi/sens mapping than
+// the one the session row claims for the whole run, with nothing in the data
+// to flag the drift. The home screen's own dpi/sens inputs are unreachable
+// during a run anyway (they live on #home, hidden by setScreen('paused')); this
+// is what closes the only other path — a dev-tools call to settings.update().
+let pendingSettings = null;
+
 settings.subscribe((state) => {
+  if (runState === 'running' || runState === 'paused') {
+    // Queued, not dropped: applied in finishRun() once the run that was live
+    // when it arrived can no longer be affected.
+    pendingSettings = state;
+    return;
+  }
   sensitivity = createSensitivity({ ...state, countScale: MOUSE_COUNT_SCALE });
   applySensitivity(controls, sensitivity);
   home.render(state);
