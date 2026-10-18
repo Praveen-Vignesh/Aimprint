@@ -18,15 +18,15 @@
 // system; agreement is now part of creating an account and is stated in the
 // sign-up card's copy.
 //
-// Sign in and sign up share one email + one password field (the "signin" and
-// "signup" buttons are two actions on the same form, not two forms) — this is
-// what `bot_driver/src/run.js` drives directly by selector, so those three
-// hooks' meaning never changes. "Sign in" / "Create account" tabs above the
-// form are pure progressive disclosure: they show or hide the sign-up-only
-// rows (full name, confirm password, strength) and the sign-in-only row
-// (remember me, forgot password), but never hide either action button —
-// clicking an action switches to its matching tab first, so the fields the
-// click is about to validate are always the ones on screen.
+// Sign in and sign up share one email + one password field, but are otherwise
+// mutually exclusive views picked by the "Sign in" / "Create account" tabs:
+// each shows only its own rows (full name, confirm password, strength for
+// sign-up; remember me, forgot password for sign-in) and only its own action
+// button — never both signin and signup buttons at once, which read as two
+// different ways to do the same thing. Default mode is 'signin', so
+// `data-auth="email"` / `"password"` / `"signin"` are visible and functional
+// without touching a tab at all — this is what `bot_driver/src/run.js` drives
+// directly by selector, so those three hooks' meaning never changes.
 //
 // Forgot password is a second, replacing view inside the same panel rather
 // than a new page: this is a static multi-page build with no router, so the
@@ -175,8 +175,11 @@ export function createAuthPanel({ root, auth, onReady = null }) {
   // --- view / tab state --------------------------------------------------
   // `view` picks which of the three top-level screens is showing; `mode`
   // (meaningful only within the 'form' view) picks which of the sign-in-only
-  // / sign-up-only rows are showing. Neither ever hides the signin/signup
-  // buttons themselves.
+  // / sign-up-only rows — and which single action button — are showing. The
+  // two buttons are never both visible: that reads as "pick one of two ways
+  // to create an account" when there is only one. Default mode is 'signin',
+  // so the signin button is the one visible without touching a tab — this is
+  // what bot_driver/src/run.js relies on.
 
   let mode = 'signin';
 
@@ -186,6 +189,8 @@ export function createAuthPanel({ root, auth, onReady = null }) {
     show(el['row-confirm-password'], signup);
     show(el['row-strength'], signup);
     show(el['row-signin-extra'], signup === false);
+    show(el.signin, signup === false);
+    show(el.signup, signup);
     el['tab-signin'].classList.toggle('active', signup === false);
     el['tab-signup'].classList.toggle('active', signup);
   }
@@ -268,7 +273,6 @@ export function createAuthPanel({ root, auth, onReady = null }) {
   }
 
   async function handleSignIn() {
-    setMode('signin');
     setFieldError(el['email-error'], '');
     setFieldError(el['password-error'], '');
     if (validate({ requireConfirm: false }) === false) return;
@@ -286,7 +290,6 @@ export function createAuthPanel({ root, auth, onReady = null }) {
   }
 
   async function handleSignUp() {
-    setMode('signup');
     setFieldError(el['email-error'], '');
     setFieldError(el['password-error'], '');
     setFieldError(el['confirm-password-error'], '');
@@ -376,19 +379,16 @@ export function createAuthPanel({ root, auth, onReady = null }) {
   el['reset-submit'].addEventListener('click', handleResetSubmit);
 
   // Enter submits, because a multi-field form that ignores Enter feels broken.
-  // Sign in rather than sign up on the shared fields: it is the
-  // non-destructive of the two, and a returning player is the common case on
-  // a form already holding an address. The full-name and confirm-password
-  // fields are only ever visible in sign-up mode, so Enter in either of them
-  // means "create the account" instead.
-  for (const field of [el.email, el.password]) {
-    field.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') handleSignIn();
-    });
+  // It submits whichever action is actually on screen for the current mode —
+  // never the hidden one, which the player couldn't have clicked anyway.
+  function handlePrimary() {
+    if (mode === 'signup') handleSignUp();
+    else handleSignIn();
   }
-  for (const field of [el.fullname, el['confirm-password']]) {
+
+  for (const field of [el.email, el.password, el.fullname, el['confirm-password']]) {
     field.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') handleSignUp();
+      if (event.key === 'Enter') handlePrimary();
     });
   }
   el['reset-email'].addEventListener('keydown', (event) => {

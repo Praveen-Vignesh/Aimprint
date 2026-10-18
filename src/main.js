@@ -135,6 +135,15 @@ const home = createHome({
 onAuthChange((state) => {
   authState = state;
   home.renderAccount({ authState });
+
+  // This page is past the gate — there is no sign-in form here, so a
+  // signed-out visitor has nothing to do but leave. Bounce them straight to
+  // the landing page rather than stranding them on a disabled Start button;
+  // 'loading' is excluded, since that is the session still restoring from
+  // localStorage, not a verdict.
+  if (state.status === 'signed_out') {
+    window.location.href = '/';
+  }
 });
 
 // One sensitivity value, two consumers historically; now just the player. Kept

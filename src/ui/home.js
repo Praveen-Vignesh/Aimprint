@@ -129,7 +129,10 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
     if (loading) {
       startNote.textContent = 'Checking your session…';
     } else if (signedIn === false) {
-      startNote.textContent = 'Sign in on the home page to start training.';
+      // Briefly visible, if at all: main.js redirects a signed-out visitor to
+      // '/' the moment the auth state resolves. This just covers the instant
+      // before that navigation lands.
+      startNote.textContent = 'Signed out — redirecting…';
     } else {
       startNote.textContent = 'Esc pauses the clock. Left click to shoot.';
     }
@@ -173,14 +176,12 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
 
       if (signedIn) accountEmail.textContent = authState.email ?? 'your account';
 
-      // Every route out of a not-ready state lives on the landing page, so the
-      // notice links there rather than offering controls this page does not have.
-      let notice = '';
-      if (signedIn === false) {
-        notice = 'You are signed out. <a href="/">Sign in on the home page</a> to save your runs.';
-      }
+      // No notice to show: a signed-out visitor is redirected to '/' by
+      // main.js before they would ever need to read one. This block only
+      // covers the instant before that navigation lands.
+      const notice = signedIn === false && authState.status !== 'loading' ? 'Redirecting to sign in…' : '';
 
-      accountNotice.innerHTML = notice;
+      accountNotice.textContent = notice;
       accountNotice.classList.toggle('hidden', notice === '');
 
       applyStartGate();

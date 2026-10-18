@@ -582,9 +582,10 @@
     }
 
     /* --------------------------------------------------------------- tabs
-       Sign in / Create account. Pure progressive disclosure — see the long
-       comment at the top of src/ui/auth-panel.js for why this never hides
-       either action button. */
+       Sign in / Create account — mutually exclusive views, each with its own
+       single action button. See the long comment at the top of
+       src/ui/auth-panel.js for why only one signin/signup button is ever
+       visible at a time. */
     .tabs {
       display: flex;
       gap: 4px;
@@ -1109,11 +1110,13 @@
         <!-- Two mutually exclusive top-level blocks (signed-out / signed-in).
              ui/auth-panel.js finds every control below by its data-auth name,
              scoped to #auth-panel, and toggles which block — and, inside
-             signed-out, which of the three views — is visible. Renaming or
-             dropping a data-auth value throws at page load with the missing
-             name, rather than failing on click. "email" / "password" /
-             "signin" also keep their exact names and behaviour because
-             bot_driver/src/run.js drives them directly by selector. -->
+             signed-out, which of the three views, and inside the form view,
+             which of the sign-in / sign-up tabs (each with its own single
+             action button) — is visible. Renaming or dropping a data-auth
+             value throws at page load with the missing name, rather than
+             failing on click. "email" / "password" / "signin" also keep
+             their exact names and behaviour because bot_driver/src/run.js
+             drives them directly by selector. -->
 
         <div data-auth="signed-out">
           <div data-auth="view-form">
