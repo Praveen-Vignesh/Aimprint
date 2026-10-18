@@ -442,27 +442,6 @@
       border-color: var(--target);
     }
 
-    .consent {
-      display: flex;
-      gap: 11px;
-      align-items: flex-start;
-      margin: 18px 0;
-      font-size: 13.5px;
-      line-height: 1.5;
-      color: var(--chalk-dim);
-      cursor: pointer;
-    }
-
-    .consent input {
-      margin-top: 3px;
-      flex-shrink: 0;
-      accent-color: var(--target);
-    }
-
-    .consent a {
-      color: var(--chalk);
-    }
-
     .fine {
       margin-top: 15px;
       font-size: 12.5px;
@@ -1004,22 +983,10 @@
 
           <p class="msg" data-auth="message" role="alert"></p>
 
-          <p class="fine">One email to confirm your address. We will only write again to
-            invite you back for another session.</p>
-        </div>
-
-        <div data-auth="consent">
-          <p class="card-head">Signed in as <strong data-auth="consent-email">&mdash;</strong></p>
-
-          <label class="consent">
-            <input type="checkbox" data-auth="consent-checkbox" />
-            <span>I agree that my mouse movement during training is recorded and used for
-              this research. <a href="/privacy">What gets recorded</a>.</span>
-          </label>
-
-          <button class="btn btn-primary btn-block" data-auth="consent-submit">Agree and start</button>
-          <p class="msg" data-auth="consent-message" role="alert"></p>
-          <button class="btn btn-ghost btn-block" data-auth="consent-signout">Sign out</button>
+          <p class="fine">Creating an account means your mouse movement during training is
+            recorded for this research. <a href="/privacy">What gets recorded</a>. One email
+            to confirm your address — we will only write again to invite you back for
+            another session.</p>
         </div>
 
         <div data-auth="signed-in">

@@ -73,9 +73,12 @@ from auth.users u
   left join public.profiles p on p.user_id = u.id
 where p.user_id is null;
 
--- 4b. Sessions with zero delivered segments — the D.1 failure signature, or a
---     run abandoned instantly. A session that is NOT yet archived and has no
---     segments after its run should have finished is worth a look.
+-- 4b. Sessions with zero delivered segments — a real delivery failure. Since
+--     the SESSION_MIN_PLAY_MS gate (src/constants.js) withholds the session row
+--     AND its segments together until a run passes one minute, an abandoned run
+--     now writes NOTHING rather than an empty session row — so a session here
+--     with no segments is no longer "they quit early", it is "segments were lost
+--     after the session landed". Worth a look either way.
 select s.id, s.subject_id, s.routine, s.started_at, s.planned_duration_ms
 from public.sessions s
   left join public.segments g on g.session_id = s.id
@@ -109,3 +112,48 @@ from public.archive_manifest a
 where a.pruned_at is not null
 group by a.session_id, a.archived_at, a.segment_count
 order by a.archived_at desc;
+
+-- ===========================================================================
+-- 5. BACKFILL ended_at / poll_hz  — safety net for a close that did not land
+-- ===========================================================================
+-- The client closes its own session row at run end (ended_at + poll_hz, through
+-- the single-shot `sessions close own` policy). If that one request is lost to
+-- a network blip or a hard crash, the columns stay null and these two UPDATEs
+-- recompute them from the segments that DID arrive. Both are idempotent (the
+-- `is null` guard) and safe to run any time; run them before an archive pass so
+-- the archived sessions carry the values.
+
+-- 5a. ended_at, from the last segment of each session. Server-anchored
+--     (started_at + active play), so it does not depend on a client clock. NOTE
+--     this is active-play end, not wall-clock end — the same figure the client
+--     would have written, minus paused spans, which are not recorded anywhere.
+update public.sessions s
+   set ended_at = s.started_at
+                + make_interval(secs => (t.ms / 1000.0)::double precision)
+  from (select session_id, max(started_at_ms + coalesce(duration_ms, 0)) as ms
+          from public.segments group by 1) t
+ where t.session_id = s.id
+   and s.ended_at is null;
+
+-- 5b. poll_hz, as the median pointer inter-arrival. input_events.dt is in TENTHS
+--     of a millisecond and dt[0] is defined as 0, so ordinality > 1 skips that
+--     leading zero and hz = 10000 / dt_tenths. This matches telemetry.js pollHz
+--     exactly — median, so one backgrounded-tab gap cannot drag it down.
+--
+--     HEAVY: reads input_events for every segment, which means the whole TOAST
+--     table. Run it on the un-archived tail only, and expect it to take a while.
+update public.sessions s
+   set poll_hz = m.hz
+  from (
+    select g.session_id,
+           10000.0 / nullif(
+             percentile_cont(0.5) within group (order by e.txt::numeric), 0) as hz
+      from public.segments g
+      cross join lateral jsonb_array_elements_text(g.input_events -> 'dt')
+                   with ordinality as e(txt, ord)
+     where g.input_events is not null
+       and e.ord > 1
+     group by g.session_id
+  ) m
+ where m.session_id = s.id
+   and s.poll_hz is null;

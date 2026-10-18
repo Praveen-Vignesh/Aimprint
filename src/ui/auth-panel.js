@@ -5,17 +5,21 @@
 // stops a second panel on a page from colliding with the first.
 //
 // `auth` supplies the async account actions (onSignIn / onSignUp /
-// onGoogleSignIn / onConsent / onSignOut), each resolving to a result object
+// onGoogleSignIn / onSignOut), each resolving to a result object
 // ({ error } / { needsConfirmation } / {}) that this module displays. The seam
 // is deliberate: this file never imports supabase.js, so it stays drivable from
 // a test harness with plain stubs.
 //
-// `onReady` fires when the account becomes both signed in and consented — the
-// landing pages use it to move the player on to the game.
+// `onReady` fires when the account becomes signed in — the landing pages use it
+// to move the player on to the game.
+//
+// There is no consent step. The checkbox, its block and the six data-auth hooks
+// it needed were removed on 2026-10-18 along with the rest of the consent
+// system; agreement is now part of creating an account and is stated in the
+// sign-up card's copy.
 
 const REQUIRED = [
   'signed-out',
-  'consent',
   'signed-in',
   'email',
   'password',
@@ -23,11 +27,6 @@ const REQUIRED = [
   'signup',
   'google',
   'message',
-  'consent-checkbox',
-  'consent-submit',
-  'consent-message',
-  'consent-email',
-  'consent-signout',
   'account-email',
   'signout'
 ];
@@ -119,36 +118,10 @@ export function createAuthPanel({ root, auth, onReady = null }) {
     if (result && result.error) setMessage(result.error, true);
   }
 
-  // Consent is collected here, after a session exists, because this is the first
-  // point at which it can actually be written to profiles. Asking before signup
-  // would only have produced a promise nothing recorded.
-  async function handleConsent() {
-    if (el['consent-checkbox'].checked === false) {
-      el['consent-message'].textContent = 'Tick the box to agree before continuing.';
-      el['consent-message'].classList.add('error');
-      return;
-    }
-
-    el['consent-submit'].disabled = true;
-    el['consent-message'].classList.remove('error');
-    el['consent-message'].textContent = 'Saving…';
-    const result = await auth.onConsent();
-    el['consent-submit'].disabled = false;
-
-    if (result && result.error) {
-      el['consent-message'].textContent = result.error;
-      el['consent-message'].classList.add('error');
-      return;
-    }
-    el['consent-message'].textContent = '';
-  }
-
   el.signin.addEventListener('click', handleSignIn);
   el.signup.addEventListener('click', handleSignUp);
   el.google.addEventListener('click', handleGoogleSignIn);
-  el['consent-submit'].addEventListener('click', handleConsent);
   el.signout.addEventListener('click', () => auth.onSignOut());
-  el['consent-signout'].addEventListener('click', () => auth.onSignOut());
 
   // Enter submits, because a two-field form that ignores Enter feels broken.
   // Sign in rather than sign up: it is the non-destructive of the two, and a
@@ -167,25 +140,17 @@ export function createAuthPanel({ root, auth, onReady = null }) {
   return {
     render(authState) {
       const signedIn = authState.status === 'signed_in';
-      // While consent is still being read, show the ready block rather than
-      // flashing the consent prompt at someone who has already agreed.
-      const needsConsent = signedIn && authState.consented === false;
-      const ready = signedIn && authState.consented !== false;
 
       show(el['signed-out'], signedIn === false);
-      show(el.consent, needsConsent);
-      show(el['signed-in'], ready);
+      show(el['signed-in'], signedIn);
 
       if (signedIn) {
-        const label = authState.email ?? 'your account';
-        el['account-email'].textContent = label;
-        el['consent-email'].textContent = label;
+        el['account-email'].textContent = authState.email ?? 'your account';
         setMessage('');
       }
 
-      const fullyReady = signedIn && authState.consented === true;
-      if (fullyReady && wasReady === false && onReady !== null) onReady();
-      wasReady = fullyReady;
+      if (signedIn && wasReady === false && onReady !== null) onReady();
+      wasReady = signedIn;
     }
   };
 }

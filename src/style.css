@@ -445,26 +445,6 @@ button.secondary:disabled:hover {
   margin-bottom: 10px;
 }
 
-.consent {
-  display: flex;
-  gap: var(--space-2);
-  align-items: flex-start;
-  margin: var(--space-3) 0;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--color-text-soft);
-  cursor: pointer;
-}
-
-.consent input {
-  margin-top: 2px;
-  flex-shrink: 0;
-}
-
-.consent a {
-  color: var(--color-accent-soft);
-}
-
 .auth-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -479,10 +459,10 @@ button.secondary:disabled:hover {
   color: var(--color-accent-hover);
 }
 
-/* Once signed in and consented the account panel has nothing left to ask for,
-   so it collapses to a single row and the routine grid becomes the first thing
-   the eye lands on. Paired with .account-row.hidden below — see the .hidden
-   comment for why that pairing is mandatory. */
+/* Once signed in the account panel has nothing left to ask for, so it collapses
+   to a single row and the routine grid becomes the first thing the eye lands on.
+   Paired with .account-row.hidden below — see the .hidden comment for why that
+   pairing is mandatory. */
 .account-row {
   display: flex;
   align-items: center;

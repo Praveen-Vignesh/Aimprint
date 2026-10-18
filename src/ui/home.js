@@ -2,7 +2,11 @@ import { ROUTINES, routineById } from '../routines/index.js';
 import { DIFFICULTY_LEVELS } from '../difficulty.js';
 import { createSensitivity } from '../sensitivity.js';
 import { formatClock } from '../hud.js';
-import { SESSION_DURATIONS_MIN, SESSION_COMPLETE_FRACTION } from '../constants.js';
+import {
+  SESSION_DURATIONS_MIN,
+  SESSION_COMPLETE_FRACTION,
+  SESSION_MIN_PLAY_MS
+} from '../constants.js';
 
 // Owns the home, pause and results screens: renders the routine catalogue and
 // sensitivity settings, writes setting changes straight back into the store, and
@@ -112,24 +116,20 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
 
   signoutButton.addEventListener('click', () => auth.onSignOut());
 
-  // Start is gated on being signed in AND consented. This mirrors canPlay() in
-  // main.js, which guards the click path; both must agree, so neither grows a
-  // condition alone. `consented === null` means the profile read is still in
-  // flight — treated as not-yet-playable rather than assumed either way.
+  // Start is gated on being signed in. This mirrors canPlay() in main.js, which
+  // guards the click path; both must agree, so neither may grow a condition
+  // alone — a gate that passes in one and fails in the other is either an
+  // unreachable button or a bypass.
   function applyStartGate() {
     const signedIn = lastAuthState.status === 'signed_in';
     const loading = lastAuthState.status === 'loading';
-    const consented = lastAuthState.consented === true;
-    const checkingConsent = signedIn && lastAuthState.consented === null;
 
-    startButton.disabled = loading || checkingConsent || signedIn === false || consented === false;
+    startButton.disabled = loading || signedIn === false;
 
-    if (loading || checkingConsent) {
+    if (loading) {
       startNote.textContent = 'Checking your session…';
     } else if (signedIn === false) {
       startNote.textContent = 'Sign in on the home page to start training.';
-    } else if (consented === false) {
-      startNote.textContent = 'Agree to telemetry collection on the home page to start.';
     } else {
       startNote.textContent = 'Esc pauses the clock. Left click to shoot.';
     }
@@ -168,7 +168,6 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
       lastAuthState = authState;
 
       const signedIn = authState.status === 'signed_in';
-      const needsConsent = signedIn && authState.consented === false;
 
       signedInBlock.classList.toggle('hidden', signedIn === false);
 
@@ -179,8 +178,6 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
       let notice = '';
       if (signedIn === false) {
         notice = 'You are signed out. <a href="/">Sign in on the home page</a> to save your runs.';
-      } else if (needsConsent) {
-        notice = 'One thing left: <a href="/">agree to telemetry collection</a> before you can start a run.';
       }
 
       accountNotice.innerHTML = notice;
@@ -202,7 +199,7 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
       if (summary === null) return;
 
       const { routineId, difficulty, plannedMs, activeMs } = summary;
-      const { hits, attempts, clicks, totalTimeMs, completed } = summary;
+      const { hits, attempts, clicks, totalTimeMs, completed, saved } = summary;
       const name = routineById(routineId)?.name ?? routineId;
       const timed = clicks === 0 ? attempts : clicks;
 
@@ -213,10 +210,21 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
         attempts === 0 ? '0%' : `${Math.round((hits / attempts) * 100)}%`;
       resultAvgTime.textContent = timed === 0 ? '0 ms' : `${Math.round(totalTimeMs / timed)} ms`;
 
+      // "Not saved" outranks the completion percentage: a run that recorded
+      // nothing is the one fact the player needs, and a discarded run that
+      // looked saved is precisely the silent loss this project cannot afford.
+      // `saved === false` only, never a falsy test — an older summary without
+      // the field must not read as discarded.
       const percent = Math.round(SESSION_COMPLETE_FRACTION * 100);
-      resultNote.textContent = completed
-        ? `Session complete — you passed the ${percent}% mark.`
-        : `Under the ${percent}% mark, so this run does not count as complete.`;
+      if (saved === false) {
+        const minimum = Math.round(SESSION_MIN_PLAY_MS / 1000);
+        resultNote.textContent =
+          `Under ${minimum} seconds, so this run was not saved — nothing was recorded.`;
+      } else {
+        resultNote.textContent = completed
+          ? `Session complete — you passed the ${percent}% mark.`
+          : `Under the ${percent}% mark, so this run does not count as complete.`;
+      }
     },
 
     setScreen(screen) {

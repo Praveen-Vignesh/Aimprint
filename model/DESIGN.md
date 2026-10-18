@@ -77,10 +77,10 @@ For the tail it pages through **`v_training_segments`**, and two properties are 
 
 The view emits `subject_id` (one subject row is one identity — duplicate merging was removed, so
 there is no collapse step) plus `duration_ms`, runs `security_invoker`, and also carries `segment_created_at`,
-`session_ended_at`, `subject_kind_source`, `subject_cohort`, `subject_labeled_at` and
-`subject_consent_version`.
+`session_ended_at`, `subject_kind_source`, `subject_cohort` and `subject_labeled_at`.
+(There is no `subject_consent_version` — the consent system was removed 2026-10-18.)
 
-**Decoding (`sampling_version = 4`):** `input_events` is delta-encoded as `{t0, dt, dx, dy}` in
+**Decoding (`sampling_version = 1`):** `input_events` is delta-encoded as `{t0, dt, dx, dy}` in
 tenths of a millisecond (reconstruct `t_ms = (t0 + cumsum(dt)) / 10` with an **integer** cumsum),
 and `trajectory` omits `tx/ty/tz` for static routines (fill them from `targets[engaged_index]`).
 In practice the fetch stage never does this itself — the **archive job decodes once on the way
@@ -119,22 +119,22 @@ Steps, in order:
 
 1. Select sessions older than a lag (`started_at < now() - interval '7 days'`, comfortably longer
    than any IndexedDB outbox replay) with no `archive_manifest` row.
-2. Read their segments, **decode to absolute values** (the `sampling_version = 4` delta /
+2. Read their segments, **decode to absolute values** (the `sampling_version = 1` delta /
    omitted-`tx/ty/tz`, above), and write one Parquet per session with zstd, Hive-partitioned:
-   `segments/sampling_version=4/routine=flick/session_id=<uuid>.parquet`. Carry `raw_subject_id`,
+   `segments/sampling_version=1/routine=flick/session_id=<uuid>.parquet`. Carry `subject_id`,
    never a resolved label.
 3. Write to the **local drive and** upload to the private Supabase Storage bucket.
 4. **Verify before deleting — a hard gate.** Re-read the Parquet; assert its row count and a
    sha256 over the sorted `(session_id, segment_index)` pairs equal the database's. This data
    cannot be re-collected, so no delete happens unless the written copy is proven complete.
-5. Insert the `archive_manifest` row (session_id, raw_subject_id, routine, difficulty,
+5. Insert the `archive_manifest` row (session_id, subject_id, routine, difficulty,
    sampling_version, segment_count, byte_size, storage_path, local_path, content_sha256), then
    `DELETE` the segments and set `pruned_at`.
 6. **Idempotent + late-arrival safe:** a manifest row whose session later has live segments again
    (`queries/campaign.sql` §4d) is a replay that landed after archival — re-archive, re-verify,
    re-prune.
 
-The decoder here is the single source of truth for the v4 codec; a JS→Python round-trip test
+The decoder here is the single source of truth for the v1 codec; a JS→Python round-trip test
 (encode a known stream in the harness, decode here, assert bit-exact including the integer cumsum)
 guards it.
 
@@ -185,9 +185,9 @@ session count matters. Protocol:
 Adding a field to `sampleFrame()` in `src/telemetry.js` without teaching `_segment_features`
 about it would silently train on the old feature set. `SAMPLING_VERSION` (`src/constants.js`)
 is stamped on every `sessions` row and is what stops a pull mixing rows from two different
-samplers — **filter on it** rather than assuming one shape. It is currently **4** (delta-encoded
-`input_events`, `tx/ty/tz` omitted for static routines); any `v3` row predates the encoding and
-must be excluded from a v4 pull, never decoded with the v4 reader.
+samplers — **filter on it** rather than assuming one shape. It is currently **1** (delta-encoded
+`input_events`, `tx/ty/tz` omitted for static routines); it was reset from 4 with the 2026-10-18
+data wipe, so there is no older shape in the database to exclude.
 
 ## Verifying this side
 

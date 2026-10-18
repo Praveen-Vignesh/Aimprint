@@ -6,18 +6,18 @@ The storage design is sized for a campaign, not a service.
 
 ## 1. What a session costs
 
-At 5-minute sessions (the campaign default), with the `sampling_version = 4` encoding below:
+At 5-minute sessions (the campaign default), with the `sampling_version = 1` encoding below:
 
 | | per segment | per 5-min session (~300 segments) |
 |---|---|---|
-| Raw JSON (v3, pre-shrink) | ~15 kB | ~8.5 MB (at 10 min) / ~4.3 MB (at 5 min) |
-| **v4, after the two lossless changes** | ~8.7 kB | **~2.6 MB** |
+| Raw JSON (pre-shrink) | ~15 kB | ~8.5 MB (at 10 min) / ~4.3 MB (at 5 min) |
+| **After the two lossless changes** | ~8.7 kB | **~2.6 MB** |
 
 The whole campaign — ~150 sessions — is therefore **~400 MB of good data**, plus slop for dev
 runs, bot debugging and re-collection. That fits comfortably in what Supabase provides, as long
 as the staging table is kept from growing without bound (§4).
 
-## 2. The `sampling_version = 4` encoding (lossless)
+## 2. The `sampling_version = 1` encoding (lossless)
 
 Two changes, both approved as lossless in *signal*, implemented in `src/telemetry.js`:
 
@@ -36,9 +36,10 @@ Two changes, both approved as lossless in *signal*, implemented in `src/telemetr
    columns are omitted and reconstructed offline from the snapshot. Only `strafing` (and the
    withheld `switching`) declare `movesTargets: true` and keep them.
 
-**`SAMPLING_VERSION` is 4.** Any `v3` row is a different shape and must be excluded from a `v4`
-training pull, never silently decoded with the wrong reader. This was free to do now (2 subjects,
-no real data) and would not have been free after collection began.
+**`SAMPLING_VERSION` is 1.** It was reset from 4 when all data was wiped on 2026-10-18, so every
+row in the database is this one shape — there is no older version to exclude. The rule still
+stands for any future change (bump it, filter on it in a pull); there is just nothing to filter
+against today.
 
 **Decoding lives in exactly one place — the offline archive job (§3).** It writes absolute,
 decoded values into Parquet, so the feature pipeline never sees the delta form and there is one
@@ -72,7 +73,7 @@ Why this shape and not client-upload-to-Storage:
   having no select policy.
 - **The `23505` idempotency contract is untouched**, along with the outbox, the keepalive flush
   and every RLS policy. Nothing from `SEGMENT_DELIVERY_INCIDENT.md` is rebuilt.
-- **Labels stay live.** The archive stores `raw_subject_id` only; `kind` and `cohort` are
+- **Labels stay live.** The archive stores `subject_id` only; `kind` and `cohort` are
   joined from the permanent `subjects` table at train time. So a
   contributor labelled *after* their sessions are archived still reclassifies retroactively —
   the property `LABELING.md` depends on.

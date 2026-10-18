@@ -65,3 +65,10 @@ Dropped in the same pass, for the same "no code path ever writes this" reason:
 `subjects.merged_into` (duplicate merging removed entirely), `sessions.bot_mode` (legacy Bot Mode
 flag), and `segments.board_trajectory` (only the withheld `switching` routine ever wrote it).
 Full record and the two ordering traps it exposed: `AUDIT-2026-10.md` follow-up section.
+
+## 5. ~~ended_at / poll_hz never filled~~ — RESOLVED 2026-10-18
+
+Both are now written by the client in one shot at run end (`closeSession` →
+`sessions close own` policy, `grant update (ended_at, poll_hz)`), with
+`queries/campaign.sql` §5 as the offline backfill if a close is lost. `poll_hz`
+is the median pointer inter-arrival measured in `telemetry.js` (`pollHz`).

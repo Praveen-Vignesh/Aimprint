@@ -1,6 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
 import { createOutbox, createIdbStore } from './outbox.js';
-import { CONSENT_VERSION } from './constants.js';
 
 const url = import.meta.env.VITE_SUPABASE_URL;
 const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -48,19 +47,17 @@ function currentOwner() {
   return currentUserId;
 }
 
-// { status: 'loading' | 'signed_in' | 'signed_out', email, userId, consented }
+// { status: 'loading' | 'signed_in' | 'signed_out', email, userId }
 //
-// `consented` mirrors profiles.consent_version: true once a version is stamped,
-// false when the row says nothing, and null while it is still being read. It is
-// deliberately SERVER state rather than a localStorage flag — the flag this
-// replaced could not survive a magic link opened on a different device from the
-// one that requested it, so consent silently went unrecorded while play
-// continued. Gating on the column makes "no consent row, no play" unconditional.
+// There is no `consented` field any more. The consent system — both column
+// pairs, the version constant, the mirror trigger and the gate that read
+// them — was removed on 2026-10-18. Agreement is now part of creating an
+// account, stated on the sign-up card, with nothing to record or re-check at
+// runtime. Playing requires a signed-in account and nothing else.
 let currentAuth = {
   status: client === null ? 'signed_out' : 'loading',
   email: null,
-  userId: null,
-  consented: null
+  userId: null
 };
 const authListeners = new Set();
 
@@ -94,10 +91,8 @@ if (client !== null) {
     if (session?.user) {
       // TOKEN_REFRESHED fires roughly hourly, and supabase-js also re-emits for
       // the same account (INITIAL_SESSION then SIGNED_IN on a fresh load).
-      // Re-resolving on those would drop `consented` back to null mid-session,
-      // which applyStartGate() reads as "still checking" and uses to disable
-      // Start under a player who is already signed in and agreed. Only a real
-      // change of account re-resolves the profile.
+      // Re-resolving the profile on those is pointless work for an account that
+      // has not changed, so only a real change of account does it.
       const sameUser =
         currentAuth.status === 'signed_in' && currentAuth.userId === session.user.id;
 
@@ -111,57 +106,26 @@ if (client !== null) {
       currentAuth = {
         status: 'signed_in',
         email: session.user.email ?? null,
-        userId: session.user.id,
-        consented: null
+        userId: session.user.id
       };
       notifyAuth();
-      // Consent needs a round trip, so it lands in a second notification. The UI
-      // treats null as "still checking" and keeps Start disabled meanwhile.
+      // This account is now the current owner, so any rows held for it (from a
+      // prior tab or a previous participant's turn on this machine) can deliver.
       //
       // Deferred out of this callback ON PURPOSE, and it must stay deferred.
       // supabase-js invokes auth state callbacks while holding its internal auth
-      // lock, and refreshConsent() calls back into client.auth.getSession().
-      // Calling a Supabase auth method from inside this callback contends with
-      // that lock, so the profile read runs against a session that is not ready
-      // and comes back empty. `consented` then publishes as false for an account
-      // that HAS agreed — which is the consent prompt reappearing on every sign
-      // in, with the correct value sitting in the database the whole time.
-      // setTimeout lets the lock release first.
-      setTimeout(refreshConsent, 0);
-      // This account is now the current owner, so any rows held for it (from a
-      // prior tab or a previous participant's turn on this machine) can deliver.
-      // Deferred for the same lock reason, and because the outbox consts below
-      // are initialised by the time a timeout fires.
+      // lock, so anything calling back into client.auth.* from in here contends
+      // with that lock and runs against a session that is not ready yet. The
+      // deferral is also what guarantees the outbox consts below are
+      // initialised by the time this fires.
       setTimeout(kickOutboxes, 0);
       return;
     }
 
     subjectPromise = null;
-    currentAuth = { status: 'signed_out', email: null, userId: null, consented: null };
+    currentAuth = { status: 'signed_out', email: null, userId: null };
     notifyAuth();
   });
-}
-
-// Reads consent state for whoever is signed in now and republishes it.
-async function refreshConsent() {
-  const pending = currentAuth.userId;
-  const auth = await ensureAuth();
-
-  // A sign-out or a different sign-in may have landed while this was in flight;
-  // publishing then would attach one account's consent to another's session.
-  if (currentAuth.userId !== pending) return;
-
-  // Compared against CONSENT_VERSION rather than merely checked for presence, so
-  // bumping the version re-prompts everyone instead of silently accepting
-  // agreement to superseded wording — which is the whole point of the constant.
-  // Bumping it therefore blocks existing players until they agree again; that is
-  // intended, and is why CONSENT_VERSION moves only on a material change.
-  //
-  // A null auth means no profile row resolved — the account cannot record consent
-  // or telemetry at all. Reporting false (not null) stops the UI hanging on
-  // "checking" forever and surfaces the failure when consent is attempted.
-  currentAuth = { ...currentAuth, consented: auth !== null && auth.consentVersion === CONSENT_VERSION };
-  notifyAuth();
 }
 
 function resolveSubjectFor(user) {
@@ -170,20 +134,14 @@ function resolveSubjectFor(user) {
   return (async () => {
     let lastError = null;
     for (let attempt = 0; attempt < 5; attempt++) {
-      // consent_version rides along on the query that was already being made —
-      // the `profiles select own` policy covers both columns.
       const { data, error } = await client
         .from('profiles')
-        .select('subject_id, consent_version')
+        .select('subject_id')
         .eq('user_id', user.id)
         .maybeSingle();
 
       if (error === null && data) {
-        return {
-          userId: user.id,
-          subjectId: data.subject_id,
-          consentVersion: data.consent_version ?? null
-        };
+        return { userId: user.id, subjectId: data.subject_id };
       }
       lastError = error;
       await sleep(200);
@@ -204,9 +162,8 @@ function resolveSubjectFor(user) {
   })();
 }
 
-// Resolves to { userId, subjectId, consentVersion } when a real account is
-// signed in, or null. Null is the "drop this write" signal — no anonymous
-// fallback exists.
+// Resolves to { userId, subjectId } when a real account is signed in, or null.
+// Null is the "drop this write" signal — no anonymous fallback exists.
 function ensureAuth() {
   if (client === null) return Promise.resolve(null);
   if (subjectPromise === null) {
@@ -222,9 +179,9 @@ function ensureAuth() {
     // A null result is a FAILURE, not an answer, so it is deliberately not
     // memoised. This read can fail transiently — the session may still be
     // restoring, or the access token may not be attached yet — and caching that
-    // null poisons every later call for the rest of the page's life: consent,
-    // session inserts and segment writes all keep resolving null with no retry,
-    // until an auth event happens to clear it. Only a real resolution sticks.
+    // null poisons every later call for the rest of the page's life: session
+    // inserts and segment writes all keep resolving null with no retry, until
+    // an auth event happens to clear it. Only a real resolution sticks.
     pending.then((auth) => {
       if (auth === null && subjectPromise === pending) subjectPromise = null;
     });
@@ -309,50 +266,45 @@ export async function validateSession() {
   await client.auth.signOut({ scope: 'local' });
 }
 
-// Stamps consent on the caller's profile. The profiles update policy permits the
-// two consent columns (not the subject link), so this passes RLS. The value is
-// copied to subjects offline so it survives account deletion (see schema.sql).
+// Closes the session row at the end of a run: the ONLY update the client is
+// permitted anywhere in this schema. `ended_at` and `poll_hz` cannot be written
+// at insert time — the row opens partway through the run, at
+// SESSION_MIN_PLAY_MS, and neither value exists until the run is over — so they
+// go through the `sessions close own` policy instead, confined to those two
+// columns by `grant update (ended_at, poll_hz)`.
 //
-// Returns {} or { error } like the other auth calls: this gates play now, so a
-// silent failure would leave the player stuck on a consent screen with no reason
-// given. On success the resolved subject is re-read, because the memoised one
-// still carries the pre-consent value.
-export async function recordConsent(version = CONSENT_VERSION) {
-  if (client === null) return { error: 'Supabase is not configured.' };
+// Deliberately NOT routed through the outbox. It is one tiny request per
+// session with nothing to batch, and the failure path is already covered by a
+// SQL backfill, so giving outbox.js a PATCH path would be new delivery
+// semantics bought for nothing.
+//
+// No .select(), and that is what makes it idempotent for free. PostgREST
+// answers an UPDATE matching zero rows with a plain 200 and no error — and
+// zero rows is exactly what a second attempt produces, because the policy's
+// `using (ended_at is null)` stops matching the moment the first one lands. So
+// "closed it" and "it was already closed" are indistinguishable, and both are
+// correct. The .is() filter below duplicates that policy predicate on purpose,
+// belt and braces.
+//
+// A failure is logged and dropped, never retried: section 5 of
+// queries/campaign.sql backfills both columns from the segments that did
+// arrive, so nothing is actually lost if this request never lands.
+export async function closeSession(sessionId, { endedAt, pollHz }) {
+  if (client === null || sessionId === null || sessionId === undefined) return;
 
-  const auth = await ensureAuth();
-  if (auth === null) return { error: 'No profile is linked to this account.' };
-
-  // The .select() is what makes this verifiable, and it is not optional.
-  // PostgREST answers an UPDATE that matched NO rows with a plain 200 and no
-  // error, so without asking for the row back an RLS refusal, a missing profile
-  // and a real write are indistinguishable. The client would report success,
-  // flip `consented` locally, let the player run — and then prompt for consent
-  // again on the next sign-in, because the column was never written. Consent
-  // that silently fails to persist is the one failure this project cannot ship.
-  const { data, error } = await client
-    .from('profiles')
-    .update({ consent_version: version, consented_at: new Date().toISOString() })
-    .eq('user_id', auth.userId)
-    .select('consent_version');
+  const { error } = await client
+    .from('sessions')
+    .update({ ended_at: endedAt, poll_hz: pollHz })
+    .eq('id', sessionId)
+    .is('ended_at', null);
 
   if (error) {
-    console.warn('Consent update failed:', error.message);
-    return { error: error.message };
+    console.warn(
+      `Session ${sessionId} could not be closed (${error.code ?? 'no code'}); ` +
+        'ended_at/poll_hz will need the offline backfill:',
+      error.message
+    );
   }
-
-  if (Array.isArray(data) === false || data.length === 0) {
-    console.warn('Consent update matched no profile row for user', auth.userId);
-    return { error: 'Your agreement could not be saved. Sign out, sign in again, and retry.' };
-  }
-
-  subjectPromise = null;
-  // Read back from what the database stored rather than assumed from intent: if
-  // the write ever lands while storing something else, the gate must follow the
-  // stored value, exactly as refreshConsent() does.
-  currentAuth = { ...currentAuth, consented: data[0].consent_version === CONSENT_VERSION };
-  notifyAuth();
-  return {};
 }
 
 // ---------------------------------------------------------------------------
@@ -520,8 +472,8 @@ export function flushTelemetryKeepalive() {
 //
 // A null auth means no profile resolved for the signed-in account — the row
 // cannot satisfy RLS and there is nothing to deliver, so it is skipped. In the
-// normal path the game only starts for a consented, signed-in account, so auth
-// resolves; this guards the edge where it does not.
+// normal path the game only starts for a signed-in account, so auth resolves;
+// this guards the edge where it does not.
 export async function insertSession(payload) {
   if (sessionOutbox === null) return;
 

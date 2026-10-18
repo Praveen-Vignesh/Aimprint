@@ -8,7 +8,6 @@ import {
   signUp,
   signOut,
   signInWithGoogle,
-  recordConsent,
   validateSession
 } from './supabase.js';
 import { createAuthPanel } from './ui/auth-panel.js';
@@ -21,9 +20,6 @@ if (root !== null) {
   const panel = createAuthPanel({
     root,
     auth: {
-      // None of the sign-in paths stamp consent. It is collected once,
-      // explicitly, from the consent block that appears after a session exists
-      // — the first moment it can be written to profiles.
       onSignIn({ email, password }) {
         return signIn({ email, password });
       },
@@ -35,14 +31,12 @@ if (root !== null) {
       },
       onGoogleSignIn() {
         return signInWithGoogle();
-      },
-      onConsent() {
-        return recordConsent();
       }
     },
-    // Fires only on the transition into signed-in-and-consented, so finishing
-    // the form carries you into the game while an already-signed-in visitor can
-    // still read the page.
+    // Fires only on the TRANSITION into signed in, so finishing the form
+    // carries you into the game while an already-signed-in visitor can still
+    // read the page — firing on every render would bounce them off it the
+    // moment it loaded.
     onReady() {
       window.location.href = PLAY_URL;
     }
@@ -99,7 +93,7 @@ if (root !== null) {
 
   onAuthChange((state) => {
     panel.render(state);
-    ready = state.status === 'signed_in' && state.consented === true;
+    ready = state.status === 'signed_in';
   });
 
   // supabase-js trusts the session it restores from localStorage without asking

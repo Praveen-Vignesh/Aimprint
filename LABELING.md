@@ -1,75 +1,46 @@
 # Label integrity — `subjects.kind` is default-deny
 
-> ## STATUS — verified against the live database 2026-09-17
-> **The migration IS applied. §4 has been run. Do not re-run it routinely.**
+> ## STATUS — schema applied from scratch on a wiped database 2026-10-18
+> **The label fix is live by construction. §5.6 (labelling the batches) is the
+> only step that remains, and it cannot start before recruitment.**
 > This block is the single place in the repo that answers "is the label fix
-> actually live", as opposed to "has the SQL been written". **Keep it current by
-> hand as the remaining steps are run.**
+> actually live". Keep it current by hand.
 >
-> Confirmed by query, not by assumption:
-> - `subjects.kind` default is `'unknown'` (§6 check 3) ✅
-> - `subjects_kind_allowed` holds all three values; **no** leftover auto-named
->   `subjects_kind_check` ✅
-> - `cohort`, `labeled_at`, `kind_source` all present ✅ (`merged_into` was also
->   present then; it has since been **removed** — see the 2026-10-17 addendum)
-> - `v_training_segments` exists, exposes `subject_kind_source` /
->   `subject_cohort` / `subject_labeled_at`, and `is_human` is **three-valued**
->   (`CASE` present) ✅ — this is the precondition §5.1 demands
-> - **0** orphaned `auth.users` rows (§4 step 2) ✅
-> - §5.2 pre-flight returned **0** rows needing backfill, so **§5.4 is a no-op**
->   on this database ✅ — against 2 total subjects, both sitting at
->   `kind='unknown', kind_source='default'`. No row was ever mislabelled.
-> - §5.5 **done** — `alter table public.subjects validate constraint
->   subjects_label_has_provenance;` ran clean, and `select conname, convalidated
->   from pg_constraint where conrelid='public.subjects'::regclass and
->   conname='subjects_label_has_provenance'` confirms `convalidated = true` ✅
->   Enforced against every existing row now, not just future writes.
-> - §5.7 divergence gate **run** — returned 0 rows (trivial at 2 subjects,
->   neither merged) ✅ Re-run after any future labelling batch, per §5.7's
->   "not optional" warning.
+> On 2026-10-18 all collected telemetry was deleted and `schema.sql` was
+> rewritten as one from-scratch DDL file (it is no longer an idempotent
+> migration — see its header) and applied clean in one buffer. Everything the
+> old STATUS block and its addenda tracked step by step is now simply **how the
+> tables are defined**, so there is nothing left to "roll out":
+>
+> - `subjects.kind` defaults to `'unknown'`, `subjects_kind_allowed` permits the
+>   three values, and `kind_source` / `cohort` / `labeled_at` exist — all inline
+>   in the `create table`.
+> - `subjects_label_has_provenance` is declared **inline and validated** (not
+>   `NOT VALID`). The old manual §5.5 `validate constraint` step is therefore
+>   **gone** — there are no pre-existing rows to grandfather on an empty table.
+> - `v_training_segments` exposes `subject_kind_source` / `subject_cohort` /
+>   `subject_labeled_at`, and `is_human` is three-valued (`CASE` present).
+> - There is **no `merged_into`** and no merge machinery: one `subjects` row is
+>   one identity. The §5.7 divergent-label gate stays removed. If the same person
+>   appears on two accounts, exclude the extra at labelling time (safe only
+>   because the cohort is ~25 hand-recruited contributors labelled by email; a
+>   public reopening would need merging back).
+> - **Consent is gone entirely** (removed in the same pass): no
+>   `consent_version` / `consented_at` on `profiles` or `subjects`, no
+>   `current_consent_version()`, no `mirror_consent_to_subject()` trigger, no
+>   consent clause in the `sessions` insert policy. Agreement is now part of
+>   creating an account. Nothing in this runbook references it any more.
+>
+> After a fresh sign-up every subject sits at `kind='unknown',
+> kind_source='default'` — unlabelled, correctly excluded from any training pull
+> until §5.6 labels it.
 >
 > Remaining: **§5.6 only** (labelling bot accounts and trusted human
 > contributors). It cannot start before Phase 6 recruitment / bot provisioning,
-> and §5.6 has the exact batch-`UPDATE` statements.
->
-> *An earlier version of this block said the database had NOT been changed, and
-> an earlier `CLAUDE.md` claimed at least one real account sat mislabelled as
-> `kind='human'`. Both were stale; the queries above resolved it — that claim
-> predated the migration and was never re-checked. If you restore from a backup
-> predating 2026-09-17, re-run the §5.2 pre-flight before trusting any of this.*
->
-> ### Addendum 2026-10-10 — pre-collection hardening (NOT yet applied to live)
-> The pre-collection pass (`AUDIT-2026-10.md`) added more to `schema.sql`: a
-> server-side **consent precondition** on the `sessions` insert policy,
-> column-level insert grants, segment shape
-> CHECKs, `search_path = ''` on the SECURITY DEFINER functions, the orphan-repair
-> block, a BRIN index, and the `archive_manifest` table. **These are in the file
-> but have NOT been applied to the live database.** Paste `schema.sql` as one
-> buffer and re-run §6 to make this STATUS current again. The default-deny label
-> fix itself is unchanged and remains live as verified 2026-09-17.
->
-> Labelling still works after a session is **archived** (`STORAGE.md`): the
-> archive stores `raw_subject_id`, and `is_human`/`cohort` are joined from
-> `subjects` at train time, so relabelling stays retroactive across the archive
-> boundary. §5.6 (labelling the batches) is still the only outstanding manual
-> step and cannot start before Phase 6 recruitment / bot provisioning.
->
-> ### Addendum 2026-10-17 — `merged_into` removed (also NOT yet applied to live)
-> Duplicate-identity merging has been **deleted** from the schema: the
-> `merged_into` column, its self-reference CHECK, the `enforce_merge_depth`
-> trigger and function, and `subjects_merged_into_idx`. The training view no
-> longer collapses anything — **one `subjects` row is one identity.** §5.7 (the
-> divergent-label gate) is therefore **removed from this runbook**; with no
-> merging, a subject carries exactly one label and there is nothing to diverge.
->
-> If the same person turns up on two accounts, **exclude the extra account**
-> rather than reconciling them. That is safe only because this cohort is ~25
-> hand-recruited contributors labelled by email, so a duplicate shows up while
-> labelling. Requiring an account does **not** prevent duplicates — one person
-> can hold two emails — so if this ever opens to public signups, merging has to
-> come back. Dropped alongside it, for the same "never written by anything"
-> reason: `profiles.display_name`, `sessions.bot_mode`,
-> `segments.board_trajectory` (see `AUDIT-2026-10.md` follow-up).
+> and §5.6 has the exact batch-`UPDATE` statements. Labelling still works after a
+> session is **archived** (`STORAGE.md`): the archive stores `subject_id`, and
+> `is_human` / `cohort` are joined from `subjects` at train time, so relabelling
+> stays retroactive across the archive boundary.
 
 **What this document is.** Why the human-vs-bot ground-truth label was unsafe,
 what changed, and the runbook for applying it. `schema.sql` is authoritative for
@@ -188,9 +159,19 @@ The file is already in the correct order. Do not reorder it.
 
 ---
 
-## 5. Manual steps — required, in this order
+## 5. Manual steps
 
-### 5.1 Verify the view FIRST (before any backfill)
+> **5.1–5.5 are HISTORICAL as of the 2026-10-18 from-scratch apply.** They were
+> the one-time steps for migrating a database that *already held data* onto the
+> default-deny label: verify the rebuilt view, pre-flight for rows that would
+> block the validate, resolve them, backfill mislabelled `'human'` rows, then
+> promote the constraint. On a database created empty from the current
+> `schema.sql` none of them apply — `subjects_label_has_provenance` is declared
+> validated inline, and there are no pre-existing rows to correct. They are kept
+> below only as the runbook to reach for if real data is ever migrated again
+> rather than wiped. **The one live step is §5.6.**
+
+### 5.1 Verify the view FIRST (before any backfill) — *historical, see banner*
 
 ```sql
 select is_human, subject_kind, subject_kind_source, subject_cohort
@@ -202,7 +183,7 @@ the schema was widened, the backfill below would flip strangers to `'unknown'`,
 which the old expression maps to `false` — "confirmed bot" — and
 `where is_human is not null` would not catch it.** Verify before, not after.
 
-### 5.2 Pre-flight: see everything that will block the validate
+### 5.2 Pre-flight: see everything that will block the validate — *historical*
 
 ```sql
 select subject_id, created_at, kind, kind_source
@@ -216,14 +197,14 @@ The backfill in 5.4 only touches `'human'` rows, but `validate constraint` in
 5.5 checks *all* rows — so a `kind='synthetic', kind_source='default'` row would
 survive the backfill and then block the validate with no obvious remedy.
 
-### 5.3 Resolve any `synthetic` / `default` rows by hand
+### 5.3 Resolve any `synthetic` / `default` rows by hand — *historical*
 
 If 5.2 returned rows with `kind='synthetic'`, they are a judgement call, not a
 mechanical backfill. Either they are genuinely provisioned bots — set
 `kind_source='provisioned'` and stamp `labeled_at` — or they are junk, and
 should go to `kind='unknown'`. Decide explicitly before continuing.
 
-### 5.4 Backfill
+### 5.4 Backfill — *historical*
 
 ```sql
 update public.subjects
@@ -246,7 +227,7 @@ stamping a timestamp would manufacture provenance that does not exist.
 > **Your own account is in this set** and becomes `'unknown'` until you re-label
 > it in 5.6.
 
-### 5.5 Promote the constraint
+### 5.5 Promote the constraint — *historical; now validated inline*
 
 ```sql
 alter table public.subjects validate constraint subjects_label_has_provenance;

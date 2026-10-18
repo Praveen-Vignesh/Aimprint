@@ -83,16 +83,16 @@ function finishRun() {
 // deliverable, capturing the first session matters more than the conversion a
 // try-before-signup hook would buy.
 
-// Consent is read from profiles.consent_version and carried on the auth state,
-// so no client-side flag tracks it. The localStorage flag this replaced could
-// not survive a magic link opened on a different device from the one that
-// requested it — consent then went unrecorded while play continued. Reading the
-// column instead makes the rule unconditional across every sign-in path.
+// The gate is a signed-in account and nothing more. The consent system that
+// used to form the second half of it — a version column read back from
+// profiles, published on the auth state as `consented` — was removed on
+// 2026-10-18; agreement is now part of creating an account and is stated on the
+// sign-up card. See schema.sql's profiles comment.
 
 let authState = getAuthState();
 
 function canPlay() {
-  return authState.status === 'signed_in' && authState.consented === true;
+  return authState.status === 'signed_in';
 }
 
 function gatedLock() {
@@ -105,9 +105,9 @@ function gatedLock() {
 
 const home = createHome({
   settings,
-  // Sign-in, sign-up and consent are not reachable from this page — they live on
-  // the landing page, where the form is. All this screen can do is let someone
-  // out of the account they arrived with.
+  // Sign-in and sign-up are not reachable from this page — they live on the
+  // landing page, where the form is. All this screen can do is let someone out
+  // of the account they arrived with.
   auth: {
     onSignOut() {
       return signOut();

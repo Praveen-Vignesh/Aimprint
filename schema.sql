@@ -1,5 +1,4 @@
--- Aim Trainer telemetry schema (v2 — multi-user).
--- Run this in the Supabase SQL editor (or psql) before starting a session.
+-- Aimprint telemetry schema — the authoritative definition.
 --
 -- PASTE THIS FILE AS ONE BUFFER — NEVER IN CHUNKS. Postgres runs a
 -- multi-statement simple query as a single implicit transaction, so a failure
@@ -9,23 +8,56 @@
 -- down: a signup landing between them gets an auth.users row with NO subjects
 -- and NO profiles row, after which the client resolves a null subject_id and
 -- silently drops every telemetry row that account ever produces — permanently,
--- with no error anywhere. Nothing in this file repairs such a user. That drop
--- also holds ACCESS EXCLUSIVE on auth.users until the run commits, so signups
--- block (they do not fail) for its duration; prefer a low-traffic moment.
--- Afterwards, confirm none were stranded:
---   select u.id, u.email, u.created_at from auth.users u
---     left join public.profiles p on p.user_id = u.id
---    where p.user_id is null;   -- expect zero rows
+-- with no error anywhere. That drop also holds ACCESS EXCLUSIVE on auth.users
+-- until the run commits, so signups block (they do not fail) for its duration;
+-- prefer a low-traffic moment. The orphan-repair block below heals anyone who
+-- slipped through an earlier run.
 --
--- Five tables:
---   subjects        — a pseudonymous person. Survives account deletion.
---   profiles        — the link between an auth.users account and a subject.
---                     Deleted with the account, which anonymises the telemetry.
---   sessions        — one timed run: one routine, one difficulty, one hardware
---                     configuration. Pointer lock only pauses it.
---   segments        — one span of play closing with an outcome. The unit the
---                     model consumes.
---   session_metrics — derived aggregates, written offline with the service key.
+-- ===========================================================================
+-- THIS FILE CREATES FROM SCRATCH. IT IS NOT A MIGRATION.
+-- ===========================================================================
+-- Every `create table` here is unconditional, and every constraint is declared
+-- INLINE in the table that owns it. That is a deliberate change from the old
+-- idempotent-migration form, which had accumulated ~250 lines of `add column if
+-- not exists` duplicating the definition two lines above it, `drop column if
+-- exists` for columns this file no longer creates, pre-emptive `drop view` /
+-- `drop policy` statements that existed only to clear dependencies before a
+-- column drop, and `do $$ if not exists (select 1 from pg_constraint …) $$`
+-- wrappers around every constraint. All of it existed to migrate a database
+-- with data in it. The data was wiped on 2026-10-18, so none of it is needed,
+-- and its absence is what makes this file readable.
+--
+-- The cost: running this against a database that already has these tables
+-- fails on the first `create table` with 42P07. That is intentional — a loud
+-- failure instead of a silent half-migration. To start over, run the teardown
+-- below FIRST. It is commented out so it cannot fire by accident.
+--
+--   -- TEARDOWN — destroys all collected telemetry. There is no undo.
+--   delete from auth.users;                  -- cascades to profiles
+--   drop table if exists
+--     public.archive_manifest, public.session_metrics, public.segments,
+--     public.sessions, public.profiles, public.subjects cascade;
+--   -- `cascade` takes the view, every policy, every index, every constraint
+--   -- and the triggers that live on these tables with them. Functions are
+--   -- free-standing and survive, so the two retired ones go by hand:
+--   drop function if exists public.current_consent_version();
+--   drop function if exists public.mirror_consent_to_subject();
+--
+-- If this schema ever has to change with real data in it, write a dated
+-- migration file for that change alone. Do not turn this one back into a
+-- migration — that is how it reached 1,232 lines the first time.
+--
+-- ===========================================================================
+-- Six tables:
+--   subjects         — a pseudonymous person. Survives account deletion.
+--   profiles         — the link between an auth.users account and a subject.
+--                      Deleted with the account, which anonymises the telemetry.
+--   sessions         — one timed run: one routine, one difficulty, one hardware
+--                      configuration. Pointer lock only pauses it.
+--   segments         — one span of play closing with an outcome. The unit the
+--                      model consumes.
+--   session_metrics  — derived aggregates, written offline with the service key.
+--   archive_manifest — the index of the offline Parquet archive (STORAGE.md).
 --
 -- Plus v_training_segments, a view (not a table) that the offline pipeline
 -- reads with the service key.
@@ -33,46 +65,11 @@
 -- The split exists because hardware and settings are session-scoped, not
 -- segment-scoped. Storing dpi/sens/refresh on every segment row would both
 -- bloat the table and permit a session whose rows disagree about the DPI.
-
--- ---------------------------------------------------------------------------
--- Legacy — nothing to do here any more
--- ---------------------------------------------------------------------------
--- v1 stored everything in one flat `telemetry_logs` table whose rows carried no
--- identity at all, so they could never be attached to a subject or mixed into a
--- multi-user training set. That table was renamed `telemetry_logs_v1`, kept as a
--- graveyard for a while, and has since been DROPPED by hand.
 --
--- This file therefore no longer renames it or revokes on it. Do not reinstate
--- either statement: `revoke` has no `if exists` form, so a revoke against a
--- table that is gone fails with 42P01 and — because the whole file runs as one
--- implicit transaction — rolls back every other change in the run.
-
--- ---------------------------------------------------------------------------
--- Drop the training view FIRST — ordering is load-bearing
--- ---------------------------------------------------------------------------
--- THE RULE: Postgres refuses to drop a column while any other object still
--- references it —
---     ERROR 2BP01: cannot drop column X because other objects depend on it
--- and because this whole file runs as ONE implicit transaction, that failure
--- rolls back every other change in the run. So every dependent object must come
--- down BEFORE the `drop column` that needs it, and is rebuilt later in the file.
---
--- Two kinds of dependent exist here, and they live in different places:
---
---   * VIEWS — dropped here, at the top. `drop view if exists` is safe even on a
---     brand-new database, because it resolves nothing but the view itself.
---     v_training_segments reads subjects/sessions/segments and is recreated in
---     full at the end of this file. It holds no data; dropping it is free.
---
---   * RLS POLICIES — dropped next to their own table, further down, NOT here.
---     `drop policy ... on public.<table>` has to resolve the table, which does
---     not exist yet at this point on a fresh database. See the `sessions insert
---     own` drop sitting immediately above `drop column bot_mode`.
---
--- Both have already cost a rolled-back run: the view (merged_into,
--- board_trajectory) and the sessions insert policy (bot_mode). When you drop a
--- column in future, grep for every view and policy that names it first.
-drop view if exists public.v_training_segments;
+-- Legacy: v1 stored everything in one flat `telemetry_logs` table whose rows
+-- carried no identity at all. It has been DROPPED. Do not reinstate a `revoke`
+-- against it — `revoke` has no `if exists` form, so a revoke on a table that is
+-- gone fails with 42P01 and rolls back this entire run.
 
 -- ---------------------------------------------------------------------------
 -- subjects
@@ -95,36 +92,29 @@ drop view if exists public.v_training_segments;
 -- never the reverse), which is the worst direction for a bot detector. Trust is
 -- granted here the same way RLS grants it below: explicitly, never by default.
 -- 'human' and 'synthetic' are set ONLY by a deliberate service-key write; see
--- the labelling runbook after the constraints.
+-- the labelling runbook after this table.
 --
 -- Because the training view joins `kind` live rather than stamping it onto each
 -- segment row, relabelling is RETROACTIVE: label a subject today and every
 -- segment they ever recorded reclassifies with it. That is what makes post-hoc
 -- manual labelling correct rather than a workaround.
+--
+-- There is NO merge mechanism and no `merged_into` column. One subject row is
+-- one identity, full stop. If the same person turns up on two accounts, exclude
+-- the extra account at labelling time; do not reconcile them here and do not
+-- add a coalesce() collapse to the training view. This is safe because the
+-- cohort is ~25 hand-recruited contributors labelled by email, so a duplicate
+-- surfaces while labelling — NOT because the sign-in gate prevents duplicates
+-- (it does not; one person can hold two emails).
 
-create table if not exists public.subjects (
+create table public.subjects (
   subject_id uuid primary key default gen_random_uuid(),
   created_at timestamptz not null default now(),
 
-  -- Default-deny. The constraint is NAMED, unlike the original inline one,
-  -- whose auto-generated name is why the migration below has to discover it by
-  -- the column it constrains instead of by name.
+  -- Default-deny.
   kind text not null default 'unknown'
     constraint subjects_kind_allowed
     check (kind in ('human', 'synthetic', 'unknown')),
-
-  -- Consent is stamped here, not only on profiles, so the record of it survives
-  -- account deletion along with the data it authorises.
-  consent_version text,
-  consented_at timestamptz,
-
-  -- REMOVED: merged_into. Duplicate-identity merging was dropped — every
-  -- subject is its own canonical identity. The campaign is ~25 hand-recruited
-  -- contributors labelled by email, so a person who signs up twice surfaces
-  -- during labelling and the extra account is excluded rather than merged.
-  -- (Note for anyone revisiting this: requiring an account does NOT prevent
-  -- duplicate identities — one person can hold two emails. What makes it safe
-  -- here is the small, personally-known cohort, not the sign-in gate.)
 
   -- How `kind` was decided, so a synthetic subject provisioned by hand is
   -- distinguishable from one that merely defaulted. 'default' is the trigger's
@@ -145,129 +135,20 @@ create table if not exists public.subjects (
 
   -- When `kind` was last deliberately set. Provenance paired with kind_source:
   -- 'what decided it' plus 'when'. NULL means never deliberately labelled.
-  labeled_at timestamptz
+  labeled_at timestamptz,
+
+  -- A deliberate label must carry its provenance. Closes the footgun where a
+  -- hand-written UPDATE sets `kind` but leaves kind_source at 'default', which
+  -- reads as "this was never actually decided" and would be demoted back to
+  -- 'unknown' by any later backfill — undoing a real decision with no error.
+  --
+  -- Declared inline and VALIDATED from row one. It used to be NOT VALID so the
+  -- file stayed re-runnable against rows that predated it, which left a
+  -- permanent manual `validate constraint` step hanging over the schema. On a
+  -- table created empty there is nothing to grandfather, so that step is gone.
+  constraint subjects_label_has_provenance
+    check (kind = 'unknown' or kind_source <> 'default')
 );
-
--- Additive migration for databases created before these columns existed.
--- `create table if not exists` above is a no-op on an existing table, so the
--- columns have to be added explicitly for a re-run to upgrade in place.
-alter table public.subjects
-  add column if not exists kind_source text not null default 'default';
--- These two are what actually upgrade a live database; the create table above
--- is a no-op there. Not redundant with the canonical definition: the training
--- view references sub.cohort, so omitting these fails loudly at view creation
--- and rolls the whole run back rather than producing a half-migrated schema.
-alter table public.subjects add column if not exists cohort text;
-alter table public.subjects add column if not exists labeled_at timestamptz;
--- The check constraint is added separately so a re-run does not error if it is
--- already present (Postgres has no "add constraint if not exists").
-do $$
-begin
-  if not exists (
-    select 1 from pg_constraint
-     where conrelid = 'public.subjects'::regclass
-       and conname = 'subjects_kind_source_check'
-  ) then
-    alter table public.subjects
-      add constraint subjects_kind_source_check
-      check (kind_source in ('default', 'provisioned', 'reviewed'));
-  end if;
-end $$;
-
--- Widen `kind` to three values. The original check was written inline and
--- UNNAMED, so Postgres auto-generated its name ('subjects_kind_check', or with
--- a digit appended if that was ever taken) — which is why it is discovered by
--- conkey (the column the expression touches) rather than by name. A by-name
--- drop that missed would leave the old two-value constraint ANDed with the new
--- one, so 'unknown' would stay rejected, and because SET DEFAULT below is not
--- validated against CHECK constraints nothing would reveal it until signup
--- broke. subjects_kind_source_check has a different conkey and is untouched;
--- subjects_label_has_provenance spans two columns and is likewise unmatched.
---
--- contype = 'c' is load-bearing, not decorative: on PG18 NOT NULL constraints
--- are catalogued in pg_constraint too, with the same conkey as this column.
---
--- Names are collected before the loop rather than dropped from under an open
--- cursor over pg_constraint.
-do $$
-declare
-  doomed text[];
-  victim text;
-begin
-  select coalesce(array_agg(con.conname), '{}')
-    into doomed
-    from pg_constraint con
-   where con.conrelid = 'public.subjects'::regclass
-     and con.contype = 'c'
-     and con.conname <> 'subjects_kind_allowed'
-     and con.conkey = array(
-           select attnum from pg_attribute
-            where attrelid = 'public.subjects'::regclass and attname = 'kind');
-
-  foreach victim in array doomed loop
-    execute format('alter table public.subjects drop constraint %I', victim);
-  end loop;
-
-  if not exists (
-    select 1 from pg_constraint
-     where conrelid = 'public.subjects'::regclass
-       and conname = 'subjects_kind_allowed'
-  ) then
-    alter table public.subjects
-      add constraint subjects_kind_allowed
-      check (kind in ('human', 'synthetic', 'unknown'));
-  end if;
-end $$;
-
--- Default-deny. MUST run AFTER the constraint above accepts 'unknown'.
--- SET DEFAULT is not validated against CHECK constraints at ALTER time — it
--- only coerces the expression to the column type and writes pg_attrdef, with
--- no constraint evaluation and no row scan. Run it first and nothing looks
--- wrong until the next signup: handle_new_user()'s `insert ... default values`
--- supplies 'unknown', the old CHECK rejects it, the exception escapes the
--- security definer trigger, and the insert into auth.users ABORTS — GoTrue
--- returns 500 and signup is broken for every new user, with a schema file that
--- reads perfectly correct. Idempotent; does not rewrite existing rows.
-alter table public.subjects alter column kind set default 'unknown';
-
--- A deliberate label must carry its provenance. Closes the one residual
--- footgun: a hand-written UPDATE that sets `kind` but leaves kind_source at
--- 'default', which the backfill's predicate would later silently demote back
--- to 'unknown' — undoing a real decision with no error.
---
--- NOT VALID is load-bearing: it enforces on every future insert and update but
--- skips the scan of existing rows, so this file stays re-runnable against a
--- database where the one-time backfill has not been applied yet. Promote it by
--- hand once, after that backfill:
---   alter table public.subjects validate constraint subjects_label_has_provenance;
--- A FRESH database has no rows to backfill and should run that validate
--- immediately, or the constraint stays permanently unvalidated.
-do $$
-begin
-  if not exists (
-    select 1 from pg_constraint
-     where conrelid = 'public.subjects'::regclass
-       and conname = 'subjects_label_has_provenance'
-  ) then
-    alter table public.subjects
-      add constraint subjects_label_has_provenance
-      check (kind = 'unknown' or kind_source <> 'default') not valid;
-  end if;
-end $$;
-
--- Drop the merged_into machinery. Duplicate-identity merging is gone, so the
--- self-reference CHECK, the depth-guard trigger and its function all go with it.
---
--- Order matters and is deliberate: the trigger and function are dropped FIRST.
--- Dropping the column cascades to the CHECK and the index that depend on it, but
--- a function is a free-standing object that no column drop removes — leaving it
--- behind would strand a SECURITY DEFINER function referencing a column that no
--- longer exists. Idempotent: every statement is `if exists`, so a re-run against
--- an already-migrated database is a no-op, and a fresh database (where the
--- column was never created) skips all three cleanly.
-drop trigger if exists subjects_enforce_merge_depth on public.subjects;
-drop function if exists public.enforce_merge_depth();
-alter table public.subjects drop column if exists merged_into;
 
 -- ---------------------------------------------------------------------------
 -- Labelling a subject  (service key / SQL editor ONLY)
@@ -318,31 +199,23 @@ alter table public.subjects drop column if exists merged_into;
 --
 --   select kind, kind_source, cohort, count(*)
 --     from public.subjects group by 1,2,3 order by 1,2,3;
---
--- (The old "divergent labels across merged duplicates" gate is gone with
--- merged_into: every subject is now its own identity, so one row carries exactly
--- one label and there is nothing to diverge. If you ever spot the same person on
--- two accounts, exclude the extra one — do not try to reconcile them here.)
 
 -- ---------------------------------------------------------------------------
 -- profiles
 -- ---------------------------------------------------------------------------
 -- One row per signed-in account. Created by a trigger on auth.users, never by
 -- the client, so a user cannot attach themselves to somebody else's subject.
+--
+-- The client can SELECT its own row and nothing more — there is no update
+-- policy and no update grant. The two consent columns that used to live here
+-- (and the `profiles update own` policy that existed solely to write them) were
+-- removed with the consent system on 2026-10-18.
 
-create table if not exists public.profiles (
+create table public.profiles (
   user_id uuid primary key references auth.users(id) on delete cascade,
   subject_id uuid not null unique references public.subjects(subject_id),
-  created_at timestamptz not null default now(),
-  consent_version text,
-  consented_at timestamptz
+  created_at timestamptz not null default now()
 );
-
--- REMOVED: display_name. It was always NULL — handle_new_user() writes only
--- (user_id, subject_id), no UI ever collected a name, nothing read it, and the
--- column grant below never made it writable. Dropped rather than left as an
--- unexplained empty column.
-alter table public.profiles drop column if exists display_name;
 
 create or replace function public.handle_new_user()
 returns trigger
@@ -368,13 +241,13 @@ create trigger on_auth_user_created
 -- Repair any auth.users row that has no profile. The drop/create of the trigger
 -- above has a window (it holds ACCESS EXCLUSIVE on auth.users, so a signup in
 -- that window BLOCKS rather than fails, but a signup that slipped through an
--- earlier run on an older file would have no subjects and no profiles row) — and
--- from then on the client resolves a null subject_id and silently drops every
--- row that account ever produces. This heals it. Idempotent (a run with no
--- orphans is a no-op) and safe to leave in the file permanently; it mirrors
+-- earlier run on an older file would have no subjects and no profiles row) —
+-- and from then on the client resolves a null subject_id and silently drops
+-- every row that account ever produces. This heals it. Idempotent (a run with
+-- no orphans is a no-op) and safe to leave here permanently; it mirrors
 -- handle_new_user() exactly, so a repaired user lands at the same default-deny
--- kind='unknown', kind_source='default'. Confirm zero orphans with the query in
--- this file's header after every run.
+-- kind='unknown', kind_source='default'. Confirm zero orphans afterwards with
+-- queries/campaign.sql section 4a.
 do $$
 declare
   orphan record;
@@ -403,8 +276,7 @@ end $$;
 --
 -- That is why each policy below calls it as `(select public.current_subject_id())`
 -- rather than bare. The scalar-subquery form becomes an InitPlan the planner
--- evaluates exactly once per statement, which is what the old comment here
--- incorrectly claimed STABLE alone was doing. Keep the wrapper.
+-- evaluates exactly once per statement. Keep the wrapper.
 create or replace function public.current_subject_id()
 returns uuid
 language sql
@@ -415,77 +287,6 @@ as $$
   select subject_id from public.profiles where user_id = auth.uid();
 $$;
 
--- The consent version of the caller, or null if they have never consented. Same
--- SECURITY DEFINER / empty-search_path / scalar-subquery discipline as
--- current_subject_id(): the sessions insert policy calls it to refuse telemetry
--- from an unconsented account AT THE DATABASE, not only in the client, where
--- canPlay() / applyStartGate() already gate it. Deliberately returns the version
--- rather than a boolean so the policy can test for existence; it compares
--- against NULL, never against a specific version, because the database has no
--- business knowing CONSENT_VERSION — currency stays a client concern (a bumped
--- version re-prompts in the client), while the EXISTENCE of consent becomes an
--- unconditional server-side precondition for writing biometric data.
-create or replace function public.current_consent_version()
-returns text
-language sql
-stable
-security definer
-set search_path = ''
-as $$
-  select consent_version from public.profiles where user_id = auth.uid();
-$$;
-
--- Consent durability. profiles.consent_version is where the client writes (it
--- is the only column pair the grant below permits), but profiles is
--- `on delete cascade` from auth.users — so deleting an account destroys the
--- only record that consent was ever given, while the sessions and segments it
--- authorised survive on the subject. subjects.consent_version exists precisely
--- to outlive that deletion, and until this trigger it was never written by
--- anything: the guarantee in the subjects comment above was aspirational.
---
--- SECURITY DEFINER because the client has no policy on subjects and must not
--- get one. This writes ONLY the two consent columns — never `kind` — so the
--- default-deny label contract is untouched. The client still cannot influence
--- anything here beyond consenting for its own profile, which is the intended
--- action.
-create or replace function public.mirror_consent_to_subject()
-returns trigger
-language plpgsql
-security definer
-set search_path = ''
-as $$
-begin
-  if new.consent_version is not null
-     and (new.consent_version, new.consented_at)
-         is distinct from (old.consent_version, old.consented_at) then
-    update public.subjects
-       set consent_version = new.consent_version,
-           consented_at    = new.consented_at
-     where subject_id = new.subject_id;
-  end if;
-  return new;
-end;
-$$;
-
--- AFTER UPDATE only. Consent is never present at INSERT — handle_new_user()
--- writes just (user_id, subject_id) — and referencing OLD in an INSERT trigger
--- would raise.
-drop trigger if exists profiles_mirror_consent on public.profiles;
-
-create trigger profiles_mirror_consent
-  after update on public.profiles
-  for each row execute function public.mirror_consent_to_subject();
-
--- One-time backfill for accounts that consented before the trigger existed.
--- Idempotent: the `is distinct from` makes a re-run a no-op.
-update public.subjects sub
-   set consent_version = p.consent_version,
-       consented_at    = p.consented_at
-  from public.profiles p
- where p.subject_id = sub.subject_id
-   and p.consent_version is not null
-   and sub.consent_version is distinct from p.consent_version;
-
 -- ---------------------------------------------------------------------------
 -- sessions
 -- ---------------------------------------------------------------------------
@@ -494,6 +295,13 @@ update public.subjects sub
 -- routine is built fresh per session (game.js start()), so routine and
 -- difficulty are genuinely session-scoped and belong here.
 --
+-- A row only exists for a run that passed SESSION_MIN_PLAY_MS (constants.js).
+-- Below that threshold the client buffers the session row AND its segments in
+-- memory and discards both, so an abandoned 10-second run leaves nothing here
+-- at all. See the gate note in src/game.js — the two must be withheld together,
+-- or segments would queue against a session id that never arrives and retry
+-- 23503 forever.
+--
 -- The hardware block is not optional metadata. dx/dy are raw device counts, so
 -- they are meaningless across users without dpi; frame cadence scales with
 -- refresh_hz; event cadence scales with poll_hz. Without these three, a model
@@ -501,53 +309,71 @@ update public.subjects sub
 -- ground truth and is stored rather than derived so a later change to
 -- sensitivity.js cannot silently reinterpret old rows.
 
-create table if not exists public.sessions (
+create table public.sessions (
   id uuid primary key default gen_random_uuid(),
   subject_id uuid not null references public.subjects(subject_id) on delete cascade,
 
-  -- Server clock. Never client-supplied: a client-set timestamp is forgeable,
-  -- and ordering matters for both fatigue effects and replay detection.
+  -- Server clock, and the one timestamp here that is not client-supplied:
+  -- ordering matters for both fatigue effects and replay detection, and
+  -- started_at is absent from the insert grant below, so it cannot be forged.
+  -- That is what makes it trustworthy to compare ended_at against.
   started_at timestamptz not null default now(),
-  -- SERVICE-WRITTEN, never by the client. The session row is inserted at
-  -- game.start(), when the end is by definition unknown, and there is no update
-  -- policy (append-only, by design), so the client cannot close it later. It is
-  -- filled offline from started_at + the last segment's (started_at_ms +
-  -- trajectory tail) — a server-anchored, monotonic figure, more trustworthy
-  -- than a forgeable client wall-clock. Do NOT "fix" this with an update policy.
+
+  -- Written by the client ONCE, at the end of the run, through the
+  -- `sessions close own` policy — the only UPDATE policy in this schema. It is
+  -- a client wall-clock and therefore forgeable; sessions_ended_at_sane below
+  -- is what catches a broken one. Acceptable because this column is
+  -- descriptive, never a model feature.
   --
-  -- Since sampling_version 3 that clock EXCLUDES paused time, so this is the end
-  -- of active play, not wall-clock end. A deliberate redefinition: active play
-  -- is the comparable figure, and wall-clock end is not recoverable (pause
-  -- spans are not recorded).
+  -- NOTE it is wall-clock end, whereas the frame clock excludes paused time, so
+  -- (ended_at - started_at) is NOT active play. Active play is
+  -- max(started_at_ms + duration_ms) over the session's segments, which is the
+  -- figure comparable to planned_duration_ms. The two differ by exactly the
+  -- paused spans, which are not otherwise recorded.
+  --
+  -- If a close request never lands (network blip, hard crash), the column stays
+  -- null and queries/campaign.sql section 5a backfills it from the segments
+  -- that did arrive.
   ended_at timestamptz,
 
-  routine text not null,
-  difficulty text not null,
+  routine text not null
+    constraint sessions_routine_allowed
+    -- Free text on the wire; a typo would mint a silent cohort that quietly
+    -- splits the dataset. gridshot and switching stay in the allowlist: the
+    -- code still exists (withheld from the UI, see routines/index.js) and
+    -- reviving one must not need a schema change.
+    check (routine in ('flick', 'gridshot', 'spidershot', 'strafing', 'switching')),
+  difficulty text not null
+    constraint sessions_difficulty_allowed
+    check (difficulty in ('easy', 'medium', 'hard')),
   -- The resolved difficulty.js entry for this session, so a later retune of
   -- ROUTINE_CONFIG does not retroactively mislabel what was actually played.
   routine_config jsonb,
 
-  -- The session length the player CHOSE, stamped at insert. Intent, not outcome:
-  -- the client can only write this row at start (no update policy — see
-  -- ended_at), so whether the run was actually finished is DERIVED OFFLINE, by
+  -- The session length the player CHOSE, stamped at insert. Intent, not
+  -- outcome: whether the run was actually finished is DERIVED OFFLINE, by
   -- comparing max(started_at_ms + duration_ms) across the session's segments
   -- against this. A run reaching >= 70% of it counts as completed
   -- (SESSION_COMPLETE_FRACTION in constants.js — keep the two in step).
-  -- NULL on rows written before timed sessions shipped, which is how you filter
-  -- them out of a completion cohort.
   planned_duration_ms int,
 
-  -- Sensitivity. See sensitivity.js — one value, two consumers.
-  dpi int not null,
-  sens double precision not null,
+  -- Sensitivity. See sensitivity.js — one value, two consumers. A zero or
+  -- negative value would divide-by-zero or silently invert the cm_per_360
+  -- derivation downstream.
+  dpi int not null constraint sessions_dpi_positive check (dpi > 0),
+  sens double precision not null constraint sessions_sens_positive check (sens > 0),
   cm_per_360 double precision,
 
-  -- Rendering and input rates. refresh_hz is a rolling client estimate off the
-  -- render loop. poll_hz is SERVICE-WRITTEN: the client leaves it null and it is
-  -- derived offline from input_events inter-arrival gaps, which measure the true
-  -- pointer polling rate more accurately than anything the page can sample.
   fov_deg double precision,
+  -- A rolling client estimate off the render loop.
   refresh_hz double precision,
+  -- The measured pointer polling rate: the MEDIAN inter-arrival gap across the
+  -- whole run, computed by the client from its own input_events stream
+  -- (telemetry.js pollHz) and written with ended_at by the same one-shot close.
+  -- Median, not mean — one backgrounded tab produces a single enormous gap that
+  -- would drag a mean down by hundreds of Hz. Null when the run captured fewer
+  -- than POLL_MIN_SAMPLES pointer events; section 5b of queries/campaign.sql
+  -- backfills it from the stored stream if needed.
   poll_hz double precision,
 
   -- Hardware/browser fingerprint. Coarse on purpose: enough to hold out a
@@ -560,82 +386,35 @@ create table if not exists public.sessions (
   screen_height int,
   device_pixel_ratio double precision,
 
-  -- REMOVED: bot_mode. It was the legacy of an in-browser Bot Mode that no
-  -- longer exists, and was always null on every new row. Synthetic data is
-  -- produced only under a subject explicitly flagged kind='synthetic'
-  -- (kind_source='provisioned') — the label belongs on the subject, never on a
-  -- client-controlled per-session field, which is the whole reason Bot Mode was
-  -- removed in the first place. Do not reintroduce a per-session bot flag.
-
   -- Stamp of the code that produced the session. Without it, a change to the
   -- sampler or to difficulty.js silently mixes incomparable rows into one set.
   app_version text not null default 'unknown',
-  sampling_version int not null default 4
+  -- Mirrors SAMPLING_VERSION in src/constants.js. Reset to 1 on 2026-10-18
+  -- along with the data wipe: there is no older data, so there is no version
+  -- history to carry. The default covers a row inserted without the key; the
+  -- client always sends it explicitly.
+  sampling_version int not null default 1,
+
+  -- Sanity bounds on the two client-closed columns. started_at is
+  -- server-stamped and ungranted, so it is a trustworthy reference. The one-day
+  -- ceiling is deliberately loose — a paused session can legitimately sit for
+  -- hours — and exists to reject a broken clock, not an imprecise one.
+  --
+  -- Written as (ended_at - started_at) rather than the more obvious
+  -- `ended_at <= started_at + interval '1 day'` ON PURPOSE. A CHECK expression
+  -- must be immutable, and `timestamptz + interval` is only STABLE — adding a
+  -- day can cross a DST boundary, so its result depends on the session
+  -- TimeZone. Subtracting two timestamptz values yields an exact interval with
+  -- no timezone involved, so `timestamptz - timestamptz` IS immutable and this
+  -- form is accepted without argument.
+  constraint sessions_ended_at_sane check (
+    ended_at is null
+    or (ended_at >= started_at and ended_at - started_at <= interval '1 day')
+  ),
+  constraint sessions_poll_hz_sane check (
+    poll_hz is null or (poll_hz > 0 and poll_hz <= 8000)
+  )
 );
-
--- Drop the legacy column (idempotent; a no-op on a fresh database).
---
--- The policy drop below is REQUIRED, not tidiness. The LIVE `sessions insert
--- own` policy still carries `and bot_mode is null` from the previous run, and
--- Postgres refuses to drop a column that any policy references:
---     ERROR 2BP01: cannot drop column bot_mode of table sessions because other
---     objects depend on it
--- The policy is recreated — without that clause — in the Row-level-security
--- section below, so dropping it here costs nothing. The whole file is one
--- transaction, so no client ever observes the window in which `sessions` has no
--- insert policy.
---
--- It lives HERE rather than in the teardown block at the top of the file
--- because `drop policy ... on public.sessions` has to resolve the table, and on
--- a genuinely fresh database that table does not exist that early. A view drop
--- has no such problem, which is why only the view sits up top.
-drop policy if exists "sessions insert own" on public.sessions;
-alter table public.sessions drop column if exists bot_mode;
-
--- Additive migration for databases created before timed sessions shipped.
--- `create table if not exists` above is a no-op on an existing table, so the
--- column has to be added explicitly for a re-run to upgrade in place.
-alter table public.sessions add column if not exists planned_duration_ms int;
-
--- The default means "what this deployment's client produces", now 4 (the client
--- always sends it explicitly, so this only covers a row inserted without the key;
--- leaving it at 3 would mislabel such a row as pre-shrink v3 data). Idempotent,
--- and it does not rewrite existing rows — old v3 rows keep sampling_version 3.
-alter table public.sessions alter column sampling_version set default 4;
-
--- dpi/sens feed sensitivity.js's cm_per_360 derivation directly; a zero or
--- negative value would divide-by-zero or silently invert it downstream.
--- Scoped by conrelid as well as conname; see the note on the segments guards
--- below for why a name-only check is unsafe.
-do $$
-begin
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.sessions'::regclass
-                    and conname = 'sessions_dpi_positive') then
-    alter table public.sessions add constraint sessions_dpi_positive check (dpi > 0);
-  end if;
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.sessions'::regclass
-                    and conname = 'sessions_sens_positive') then
-    alter table public.sessions add constraint sessions_sens_positive check (sens > 0);
-  end if;
-  -- routine/difficulty are free text on the wire; a typo would mint a silent
-  -- cohort that quietly splits the dataset. gridshot and switching stay in the
-  -- allowlist: the code still exists (withheld from the UI, see routines/index.js)
-  -- and any pre-existing rows must still validate.
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.sessions'::regclass
-                    and conname = 'sessions_routine_allowed') then
-    alter table public.sessions add constraint sessions_routine_allowed
-      check (routine in ('flick', 'gridshot', 'spidershot', 'strafing', 'switching'));
-  end if;
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.sessions'::regclass
-                    and conname = 'sessions_difficulty_allowed') then
-    alter table public.sessions add constraint sessions_difficulty_allowed
-      check (difficulty in ('easy', 'medium', 'hard'));
-  end if;
-end $$;
 
 -- ---------------------------------------------------------------------------
 -- segments
@@ -653,28 +432,47 @@ end $$;
 --   trajectory   {t, dx, dy, yaw, pitch, tx, ty, tz, on}  — one entry per
 --                rendered frame. Carries the world state (target position,
 --                crosshair-on-target), which only exists at render time.
---   input_events {t, dx, dy}                              — one entry per raw
---                pointer sample (getCoalescedEvents), at native polling rate.
---                Carries sub-frame timing, which render-cadence sampling
---                destroys. Nullable: a session may run without raw capture.
+--                tx/ty/tz are OMITTED for static-target routines (flick,
+--                spidershot): the engaged target does not move within a
+--                segment, so its position already lives in `targets` at
+--                engaged_index. Only routines declaring `movesTargets`
+--                (strafing, and the withheld switching) carry them.
+--   input_events {t0, dt, dx, dy}  — one entry per raw pointer sample
+--                (getCoalescedEvents), at native polling rate, DELTA-ENCODED
+--                with t0 and every dt an integer number of TENTHS of a
+--                millisecond and dt[0] = 0. Absolute ms is
+--                (t0 + cumsum(dt)) / 10, with an INTEGER cumsum — a float
+--                cumsum over hundreds of terms would drift. Carries sub-frame
+--                timing, which render-cadence sampling destroys. Nullable: a
+--                session may run without raw capture.
 --
 -- These are not interchangeable. trajectory without input_events loses the
 -- biometric signal; input_events without trajectory loses tracking error.
+--
+-- There is no board_trajectory column. It recorded the per-frame paths of the
+-- NON-engaged targets and only the withheld multi-target `switching` routine
+-- ever wrote it, so every row had it NULL. Reviving switching means re-adding
+-- the column, its shape guard, its lz4 line and its grant entry. It is NOT the
+-- same thing as trajectory's tx/ty/tz, which is the ENGAGED target's path and
+-- is still written by strafing.
 
-create table if not exists public.segments (
+create table public.segments (
   id uuid primary key default gen_random_uuid(),
   session_id uuid not null references public.sessions(id) on delete cascade,
 
   -- Position within the session. Warmup, fatigue and any sequence model need
   -- ordering, and created_at cannot supply it: inserts are fire-and-forget and
-  -- can land out of order.
-  segment_index int not null,
+  -- can land out of order. Contiguous from 0 even across a pause, and even
+  -- across the SESSION_MIN_PLAY_MS gate, which delays delivery without
+  -- renumbering.
+  segment_index int not null
+    constraint segments_segment_index_nonneg check (segment_index >= 0),
   created_at timestamptz not null default now(),
   -- Milliseconds of ACTIVE PLAY from session start to segment start, from the
-  -- same clock the frames use. Since sampling_version 3 that clock excludes
-  -- paused time, so max(started_at_ms + duration_ms) over a session is directly
-  -- comparable to sessions.planned_duration_ms — which is what makes the
-  -- completion verdict derivable with no gap-detection heuristic.
+  -- same clock the frames use: it excludes paused time, so
+  -- max(started_at_ms + duration_ms) over a session is directly comparable to
+  -- sessions.planned_duration_ms — which is what makes the completion verdict
+  -- derivable with no gap-detection heuristic.
   started_at_ms int,
 
   outcome text not null check (outcome in ('hit', 'miss', 'timeout', 'track')),
@@ -692,7 +490,8 @@ create table if not exists public.segments (
   click_offset_y double precision,
 
   -- Board layout at segment start: [{x, y, z, r}].
-  target_count int not null,
+  target_count int not null
+    constraint segments_target_count_positive check (target_count > 0),
   targets jsonb not null,
   -- Index into `targets` of the engaged target — the one aimTarget() returned
   -- and the one tx/ty/tz tracks. Without it the engaged target is only
@@ -702,26 +501,16 @@ create table if not exists public.segments (
   trajectory jsonb not null,
   input_events jsonb,
 
-  -- REMOVED: board_trajectory. It recorded the per-frame paths of the
-  -- NON-engaged targets, and only one routine ever wrote it — `switching`, the
-  -- multi-target moving drill, which is withheld from the UI. No shipping
-  -- routine populated it, so every row had it NULL. Reviving `switching` means
-  -- re-adding this column, its shape guard, its lz4 line and its grant entry.
-  --
-  -- NOTE: this is NOT the same thing as `trajectory`'s tx/ty/tz, which records
-  -- the ENGAGED target's path and is still written by `strafing` (a shipping
-  -- routine with a moving target). Removing that would destroy strafing's
-  -- tracking-error signal — see `movesTargets` in src/telemetry.js.
-
   -- Lengths lifted out of the jsonb so segments can be filtered and sanity
   -- checked without parsing either blob.
-  frame_count int not null,
+  frame_count int not null
+    constraint segments_frame_count_positive check (frame_count > 0),
   event_count int,
   -- Segment play-time, lifted out of the trajectory's last `t` so "how long was
   -- this segment" is a column query, not a blob parse. A segment never spans a
   -- pause (one closes at pause and a fresh one opens on resume), so this is
   -- uncontaminated. Whole-session active play, and the completion verdict, are
-  -- derived offline (see sessions.ended_at and sessions.planned_duration_ms).
+  -- derived offline (see sessions.planned_duration_ms).
   duration_ms int,
 
   constraint segments_session_order unique (session_id, segment_index),
@@ -736,127 +525,67 @@ create table if not exists public.segments (
       and click_offset_x is null
       and click_offset_y is null
     )
+  ),
+
+  -- A null satisfies a Postgres CHECK (it fails only when the expression is
+  -- false), so this leaves click-only fields untouched on non-click rows while
+  -- still rejecting a negative one. AND short-circuits to false on any false
+  -- operand, so one combined constraint rejects exactly what three separate
+  -- ones would.
+  constraint segments_durations_nonneg check (
+    time_to_click_ms >= 0 and dwell_ms >= 0 and duration_ms >= 0
+  ),
+
+  -- Shape guards. Each row states a count AND separately carries the array it
+  -- counts; these make the database reject a row where the two disagree, so an
+  -- assembly bug in telemetry.js is caught at write time rather than surfacing
+  -- months later as a malformed feature in the pipeline — against data that, by
+  -- then, cannot be re-collected.
+  --
+  -- The `?` (key-exists) test is LOAD-BEARING: jsonb_array_length(null)
+  -- returns null, and a null expression SATISFIES a CHECK, so a blob that is
+  -- present but missing its key would pass a bare length comparison.
+  -- `? 'dt'` / `? 't'` turns that into a hard failure.
+  --
+  -- input_events uses key 'dt' because the stream is delta-encoded:
+  -- {t0, dt:[...], dx, dy} with dt[0]=0, so len(dt) == event_count exactly.
+  -- The trajectory key stays 't'.
+  --
+  -- All four are declared inline and VALIDATED. They were NOT VALID in the old
+  -- file only because the live table held pre-reset rows whose input_events was
+  -- the old {t, dx, dy} shape, which this check rejects — the failure that
+  -- rolled back a migration run with 23514. A table created empty has nothing
+  -- to grandfather, so the whole NOT VALID / `validate constraint` dance is
+  -- gone.
+  constraint segments_targets_len_matches
+    check (jsonb_array_length(targets) = target_count),
+  constraint segments_trajectory_len_matches
+    check (trajectory ? 't' and jsonb_array_length(trajectory -> 't') = frame_count),
+  constraint segments_input_events_len_matches check (
+    input_events is null
+    or (input_events ? 'dt' and jsonb_array_length(input_events -> 'dt') = event_count)
+  ),
+  constraint segments_engaged_index_in_range check (
+    engaged_index is null or (engaged_index >= 0 and engaged_index < target_count)
   )
 );
 
--- Additive migration for databases created before these columns existed.
-alter table public.segments add column if not exists duration_ms int;
-
--- Drop the withheld multi-target column (idempotent; no-op on a fresh database).
-alter table public.segments drop column if exists board_trajectory;
-
--- Sanity bounds on fields the model reads directly. None of these should ever
--- be violated by the client as it stands today; they exist so a bug (or a
--- request crafted by hand against the REST API) can't quietly seed the
--- training set with a negative duration or a zero-frame segment instead of
--- being rejected at write time. A null still satisfies each of these (Postgres
--- CHECK is satisfied unless the expression is false), so click-only fields
--- stay untouched on non-click rows.
--- Each guard is scoped by conrelid as well as conname. Constraint names are
--- only unique per TABLE in Postgres, not per schema, so a name-only check would
--- silently skip adding a constraint here because an unrelated table already
--- carries one by that name — leaving the column unguarded with no error.
-do $$
-begin
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.segments'::regclass
-                    and conname = 'segments_frame_count_positive') then
-    alter table public.segments add constraint segments_frame_count_positive check (frame_count > 0);
-  end if;
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.segments'::regclass
-                    and conname = 'segments_target_count_positive') then
-    alter table public.segments add constraint segments_target_count_positive check (target_count > 0);
-  end if;
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.segments'::regclass
-                    and conname = 'segments_segment_index_nonneg') then
-    alter table public.segments add constraint segments_segment_index_nonneg check (segment_index >= 0);
-  end if;
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.segments'::regclass
-                    and conname = 'segments_durations_nonneg') then
-    alter table public.segments add constraint segments_durations_nonneg
-      check (time_to_click_ms >= 0 and dwell_ms >= 0 and duration_ms >= 0);
-  end if;
-end $$;
-
--- Shape guards. Each row states a count AND separately carries the array it
--- counts; these make the database reject a row where the two disagree, so an
--- assembly bug in telemetry.js is caught at write time rather than surfacing
--- months later as a malformed feature in the pipeline — against data that, by
--- then, cannot be re-collected.
---
--- The `?` (key-exists) test is LOAD-BEARING: jsonb_array_length(null) returns
--- null, and a null expression SATISFIES a CHECK (a check fails only when it is
--- false), so a blob that is present but missing its key would pass a bare
--- length comparison. `? 'dt'`/`? 't'` turns that into a hard failure.
---
--- input_events uses key 'dt' because sampling_version 4 delta-encodes it:
--- {t0, dt:[...], dx, dy} with dt[0]=0, so len(dt) == event_count exactly. The
--- trajectory key stays 't'.
---
--- ALL FIVE are NOT VALID, and that is load-bearing, not a convenience. The
--- table is NOT empty: a live database may already hold pre-v4 rows whose
--- input_events is the OLD shape ({t, dx, dy} — absolute t, no 'dt' key), which
--- the input_events check rejects. NOT VALID enforces the shape on every future
--- INSERT/UPDATE (which are all v4 and conform) while skipping the scan of
--- existing rows — so the migration does not fail on history, and the append-only
--- v3 rows are grandfathered. They are excluded from a v4 training pull by
--- sampling_version and will be pruned anyway, so there is nothing to gain from
--- validating against them. Do NOT `validate constraint` these while any pre-v4
--- row remains; it would scan every row and TOASTed blob under ACCESS EXCLUSIVE
--- and fail on the old input_events shape. A genuinely fresh (empty) database
--- loses nothing by their being NOT VALID — there are no rows to validate.
-do $$
-begin
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.segments'::regclass
-                    and conname = 'segments_targets_len_matches') then
-    alter table public.segments add constraint segments_targets_len_matches
-      check (jsonb_array_length(targets) = target_count) not valid;
-  end if;
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.segments'::regclass
-                    and conname = 'segments_trajectory_len_matches') then
-    alter table public.segments add constraint segments_trajectory_len_matches
-      check (trajectory ? 't' and jsonb_array_length(trajectory -> 't') = frame_count) not valid;
-  end if;
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.segments'::regclass
-                    and conname = 'segments_input_events_len_matches') then
-    alter table public.segments add constraint segments_input_events_len_matches
-      check (
-        input_events is null
-        or (input_events ? 'dt' and jsonb_array_length(input_events -> 'dt') = event_count)
-      ) not valid;
-  end if;
-  if not exists (select 1 from pg_constraint
-                  where conrelid = 'public.segments'::regclass
-                    and conname = 'segments_engaged_index_in_range') then
-    alter table public.segments add constraint segments_engaged_index_in_range
-      check (engaged_index is null or (engaged_index >= 0 and engaged_index < target_count)) not valid;
-  end if;
-end $$;
-
--- TOAST compression for the three payload columns. Every one of these blobs is
+-- TOAST compression for the two payload columns. Every one of these blobs is
 -- far over the ~2 kB TOAST threshold, so all of them are compressed and pushed
 -- out of line on every insert — which makes the compressor a per-insert CPU
 -- cost paid by every concurrent writer. lz4 is markedly faster than the default
 -- pglz at a comparable ratio on this shape of data (long runs of repetitive
 -- numeric headers), so this is throughput, not disk.
 --
--- Applies to newly written values only; existing rows keep whatever they were
--- written with, which is fine because both algorithms stay readable.
 -- Deliberately NOT `set storage external` — that would disable compression
 -- entirely and roughly triple the disk these columns occupy.
 --
 -- Wrapped so a server built without lz4 degrades to a notice instead of
--- rolling back the entire migration (the whole file is one transaction).
--- Every statement here shares ONE exception handler, so a single failing line
--- rolls back the whole block — the others would silently revert to pglz while
--- reporting only "lz4 unavailable". That is why the dropped board_trajectory
--- line was removed rather than left to error. Keep this block to live columns.
+-- rolling back the entire run (the whole file is one transaction). Every
+-- statement here shares ONE exception handler, so a single failing line rolls
+-- back the whole block — the others would silently revert to pglz while
+-- reporting only "lz4 unavailable". Keep this block to live columns only; a
+-- line naming a dropped column would take both of these down with it.
 do $$
 begin
   alter table public.segments alter column trajectory   set compression lz4;
@@ -886,7 +615,7 @@ alter table public.segments set (toast.autovacuum_vacuum_scale_factor = 0.05);
 -- measures without a migration; promote one to a column when you want to index
 -- or sort on it.
 
-create table if not exists public.session_metrics (
+create table public.session_metrics (
   session_id uuid primary key references public.sessions(id) on delete cascade,
   computed_at timestamptz not null default now(),
   metrics_version int not null default 1,
@@ -908,16 +637,16 @@ create table if not exists public.session_metrics (
 -- without reading the blobs: one row per archived session, with the checksum
 -- that gated the delete.
 --
--- It stores raw_subject_id, NEVER a resolved label. kind and cohort are
--- joined LIVE from subjects at train time, so retroactive relabelling still
--- works after a session is archived (label a contributor today, every archived
--- session of theirs reclassifies). Freezing is_human here would destroy that.
+-- It stores subject_id, NEVER a resolved label. kind and cohort are joined LIVE
+-- from subjects at train time, so retroactive relabelling still works after a
+-- session is archived (label a contributor today, every archived session of
+-- theirs reclassifies). Freezing is_human here would destroy that.
 --
 -- Service-key only: RLS on, zero client policies. The client never reads or
 -- writes it, exactly like the archive job's Storage bucket.
-create table if not exists public.archive_manifest (
+create table public.archive_manifest (
   session_id        uuid primary key references public.sessions(id) on delete cascade,
-  raw_subject_id    uuid not null references public.subjects(subject_id),
+  subject_id        uuid not null references public.subjects(subject_id),
   routine           text not null,
   difficulty        text not null,
   sampling_version  int  not null,
@@ -944,120 +673,132 @@ create table if not exists public.archive_manifest (
 -- ---------------------------------------------------------------------------
 -- The training pull is "every segment for these subjects, in order"; the app
 -- reads "this subject's recent sessions".
+--
+-- There is deliberately NO index on segments.outcome, and reinstating one would
+-- be a regression. `outcome` has four distinct values on what will be the
+-- largest table here, so the planner will never choose it over a sequential
+-- scan; and nothing queries it anyway — segments has no select policy at all,
+-- and the training pull filters on routine and label, never outcome. It was
+-- also actively harmful: Postgres appends the heap TID as an implicit btree
+-- tiebreaker, so on an append-only table every insert of a given outcome lands
+-- at the right edge of that key's range. Four values means four hot leaf pages
+-- shared by every concurrent writer — buffer-content-lock contention that
+-- scales with user count, paid on every insert, for a read that never happens.
+--
+-- There is also no separate (session_id, segment_index) index:
+-- segments_session_order's unique constraint above already IS that index, and a
+-- second one would add write overhead with no query it serves that the first
+-- does not.
 
-create index if not exists sessions_subject_started_idx
+create index sessions_subject_started_idx
   on public.sessions (subject_id, started_at desc);
-create index if not exists sessions_routine_difficulty_idx
+create index sessions_routine_difficulty_idx
   on public.sessions (routine, difficulty);
--- No separate (session_id, segment_index) index: segments_session_order's
--- unique constraint above already is that index; a second one would only add
--- write overhead with no query it serves that the first doesn't.
-drop index if exists public.segments_session_idx;
--- segments_outcome_idx is DROPPED, not merely unused. `outcome` has four
--- distinct values on what will be the largest table here, so the planner will
--- never choose it over a sequential scan; and nothing queries it anyway —
--- segments has no select policy at all, and the training pull filters on
--- routine and label, never outcome. It was also actively harmful: Postgres
--- appends the heap TID as an implicit btree tiebreaker, so on an append-only
--- table every insert of a given outcome lands at the right edge of that key's
--- range. Four values means four hot leaf pages shared by every concurrent
--- writer — buffer-content-lock contention that scales with user count, paid on
--- every insert, for a read that never happens. Do not reinstate it.
-drop index if exists public.segments_outcome_idx;
-create index if not exists subjects_kind_idx
+create index subjects_kind_idx
   on public.subjects (kind);
--- subjects_merged_into_idx is gone with the merged_into column; the column drop
--- above cascades to it, and recreating it here would error against a column
--- that no longer exists.
--- Incremental pulls ("every segment since the last fetch") and the archive job's
--- age selection both need to range-scan created_at. BRIN, not btree, precisely
--- because the table is append-only: created_at is perfectly correlated with
--- physical row order, which is the one case BRIN is built for. It costs a few kB
--- (a btree would be hundreds of MB) and, unlike a btree, adds no hot right-edge
--- leaf page for every concurrent writer to contend on — the same contention that
--- got segments_outcome_idx dropped above.
-create index if not exists segments_created_at_brin
+-- Incremental pulls ("every segment since the last fetch") and the archive
+-- job's age selection both need to range-scan created_at. BRIN, not btree,
+-- precisely because the table is append-only: created_at is perfectly
+-- correlated with physical row order, which is the one case BRIN is built for.
+-- It costs a few kB (a btree would be hundreds of MB) and, unlike a btree, adds
+-- no hot right-edge leaf page for every concurrent writer to contend on — the
+-- same contention that keeps segments_outcome_idx permanently unbuilt.
+create index segments_created_at_brin
   on public.segments using brin (created_at);
 
 -- ---------------------------------------------------------------------------
 -- Row level security
 -- ---------------------------------------------------------------------------
--- Append-only for the client. There is no update or delete policy anywhere: a
--- behavioural reference set an account holder can rewrite is not a reference
--- set. Corrections are made with the service key.
+-- Append-only for the client, with ONE exception: the single-shot
+-- `sessions close own` update below, which writes ended_at/poll_hz once per run
+-- and can never fire twice on the same row. There is no delete policy anywhere,
+-- and no update policy on any other table — a behavioural reference set an
+-- account holder can rewrite is not a reference set. Corrections are made with
+-- the service key.
 --
--- anon has no privileges at all — inserting requires a signed-in user whose
+-- anon has no privileges at all — writing requires a signed-in user whose
 -- subject the row already belongs to.
 
-alter table public.subjects        enable row level security;
-alter table public.profiles        enable row level security;
-alter table public.sessions        enable row level security;
-alter table public.segments        enable row level security;
-alter table public.session_metrics enable row level security;
+alter table public.subjects         enable row level security;
+alter table public.profiles         enable row level security;
+alter table public.sessions         enable row level security;
+alter table public.segments         enable row level security;
+alter table public.session_metrics  enable row level security;
 -- archive_manifest gets RLS on and NO policy of any kind: it is written and read
 -- only with the service key by the offline archive job. RLS-on-no-policy denies
 -- the client everything, which is the whole intent.
 alter table public.archive_manifest enable row level security;
 
--- The v1 `telemetry_logs_v1` table used to be sealed here (RLS on, all grants
--- revoked from anon and authenticated). It has been dropped, so there is
--- nothing left to seal — see the Legacy note at the top of this file.
-
 -- subjects: no client policy of any kind. `kind` in particular must stay
--- unwritable, or a synthetic run could relabel itself human.
+-- unwritable, or a synthetic run could relabel itself human. Model predictions
+-- must never be written back into it either — ground truth is what a person
+-- decided, and a retrain that consumes its predecessor's guesses amplifies its
+-- own errors, silently, across every future retrain.
 
--- profiles: a user may read their own row (consent state) and update the two
--- consent columns. The subject link is not writable.
-drop policy if exists "profiles select own" on public.profiles;
+-- profiles: a user may read their own row. That is all — no update policy and
+-- no update grant, so the row is immutable to the client. The revoke is a
+-- tightening, not an oversight: it replaces the `profiles update own` policy
+-- plus a two-column consent grant, both removed with the consent system.
 create policy "profiles select own"
   on public.profiles for select to authenticated
   using (user_id = auth.uid());
 
-drop policy if exists "profiles update own" on public.profiles;
-create policy "profiles update own"
-  on public.profiles for update to authenticated
-  using (user_id = auth.uid())
-  with check (user_id = auth.uid() and subject_id = (select public.current_subject_id()));
-
--- RLS alone cannot restrict *which columns* an update touches — the policy
--- above passes for any column value as long as user_id/subject_id are intact.
--- Column-level grants are what actually confine a write to the two consent
--- columns, matching the comment above this table; without this, created_at
--- would be just as writable via the same policy.
 revoke update on public.profiles from authenticated;
-grant update (consent_version, consented_at) on public.profiles to authenticated;
 
--- sessions: insert and read your own. The extra null checks stop a client from
--- planting a value in a column documented as SERVICE-WRITTEN (see sessions
--- above) at insert time — there is no update policy to fix it afterwards, so
--- a forged value here would otherwise stand forever.
-drop policy if exists "sessions insert own" on public.sessions;
+-- sessions: insert and read your own, and close your own exactly once. The
+-- null checks in the insert policy stop a client planting a value in a column
+-- it is only allowed to write at CLOSE time, which would otherwise let it skip
+-- the close policy's one-shot guard entirely.
 create policy "sessions insert own"
   on public.sessions for insert to authenticated
   with check (
     subject_id = (select public.current_subject_id())
-    -- Consent is a server-side precondition for writing biometric data, not only
-    -- a client gate (canPlay()/applyStartGate()). Existence, not version match —
-    -- see current_consent_version(). Scalar-subquery form for the InitPlan reason
-    -- the other policies document.
-    and (select public.current_consent_version()) is not null
     and ended_at is null
     and poll_hz is null
   );
 
-drop policy if exists "sessions select own" on public.sessions;
 create policy "sessions select own"
   on public.sessions for select to authenticated
   using (subject_id = (select public.current_subject_id()));
 
+-- THE ONE UPDATE POLICY IN THIS SCHEMA. It exists because ended_at and poll_hz
+-- are not knowable when the row is inserted: the session row opens partway
+-- through the run (at SESSION_MIN_PLAY_MS) and both values only exist once the
+-- run has finished.
+--
+-- `using (ended_at is null)` is what makes it SINGLE-SHOT: once a row is closed
+-- it no longer matches the policy, so no later update can touch it again — not
+-- to correct it, not to overwrite it. `with check (ended_at is not null)` stops
+-- it being used to re-open a row by nulling the column back out. Both sides pin
+-- subject_id so the row cannot be reassigned to another subject on the way
+-- through.
+--
+-- RLS cannot restrict WHICH COLUMNS an update writes — this policy passes for
+-- any value of any column. The column-level grant below is what actually
+-- confines it to two columns; without it, routine, dpi and every other field
+-- would be just as writable through the same policy.
+create policy "sessions close own"
+  on public.sessions for update to authenticated
+  using (
+    subject_id = (select public.current_subject_id())
+    and ended_at is null
+  )
+  with check (
+    subject_id = (select public.current_subject_id())
+    and ended_at is not null
+  );
+
+revoke update on public.sessions from authenticated;
+grant update (ended_at, poll_hz) on public.sessions to authenticated;
+
 -- Column-level insert grant. RLS gates which ROWS you may insert, never which
--- COLUMNS — the policy above passes for any value of any column. So the fields
--- documented as SERVICE-WRITTEN (started_at, ended_at, poll_hz) were
--- forgeable despite their comments. Revoking table-level insert and granting it
--- per column is what actually confines the client, exactly as the profiles
--- UPDATE grant does. `id` IS granted: the client mints the session uuid so a
--- segment can be enqueued before the row's insert resolves (see supabase.js); a
--- collision merely raises 23505 and leaks nothing.
+-- COLUMNS — the insert policy above passes for any value of any column. So
+-- started_at (server clock) and ended_at/poll_hz (close-time only) would be
+-- forgeable at insert despite their comments. Revoking table-level insert and
+-- granting it per column is what actually confines the client. `id` IS granted:
+-- the client mints the session uuid so a segment can be enqueued before the
+-- row's insert resolves (see supabase.js); a collision merely raises 23505 and
+-- leaks nothing.
 --
 -- HAZARD — read before adding any client-written session column: a column the
 -- client sends but is NOT granted here fails the whole insert with 42501, which
@@ -1077,7 +818,6 @@ grant insert (
 -- trajectory and input_events are the raw material of the biometric template,
 -- and a compromised account should not be able to download its own reference
 -- data to replay it. Aggregates reach the player through session_metrics.
-drop policy if exists "segments insert own" on public.segments;
 create policy "segments insert own"
   on public.segments for insert to authenticated
   with check (
@@ -1102,7 +842,6 @@ grant insert (
 ) on public.segments to authenticated;
 
 -- session_metrics: read your own. Writes are service-key only.
-drop policy if exists "session metrics select own" on public.session_metrics;
 create policy "session metrics select own"
   on public.session_metrics for select to authenticated
   using (
@@ -1124,13 +863,8 @@ create policy "session metrics select own"
 -- `is_human` IS THREE-VALUED: true (confirmed human), false (confirmed
 -- synthetic), NULL (nobody has labelled this subject). NULL is the default
 -- state of every public signup and MUST be filtered out before fitting —
--- `where is_human is not null` — never coerced or imputed. A boolean CLI flag
--- cannot express that filter, so the pipeline needs a three-state option.
--- subject_kind_source is the audit column: once
--- subjects_label_has_provenance is validated, `is_human is not null` already
--- implies a deliberate label, so adding
--- `and subject_kind_source in ('provisioned','reviewed')` should never change
--- the row count — if it does, that constraint was never promoted.
+-- never coerced or imputed. A boolean CLI flag cannot express that filter, so
+-- the pipeline needs a three-state option.
 --
 -- security_invoker so the view runs with the caller's privileges, not the
 -- owner's. The real protection is the revoke below (only the service key, which
@@ -1138,17 +872,9 @@ create policy "session metrics select own"
 -- single future GRANT would otherwise expose every subject's trajectories
 -- through an owner-privileged view.
 --
--- subject_id is the grouping key for a train/test split (GroupKFold). There is
--- no longer any merge/collapse step: duplicate-identity merging was removed, so
--- one subject row is one identity, full stop. If the same person ever turns up
--- on two accounts, exclude the extra one at fetch time rather than reconciling
--- them here.
+-- subject_id is the grouping key for a train/test split (GroupKFold). One
+-- subject row is one identity, so there is no merge or collapse step.
 --
--- Dropped and recreated rather than CREATE OR REPLACE: replace can only append
--- columns to the end of an existing view, and this revision both changes the
--- is_human expression and inserts the provenance columns mid-list, which
--- replace rejects. The view holds no data, so dropping it is free.
-
 -- CONSUMING THIS VIEW (notes for fetch_telemetry.py):
 --  * Filter the label with `where subject_kind in ('human','synthetic')`, NOT
 --    `where is_human is not null`. is_human is a CASE expression, so the latter
@@ -1165,8 +891,6 @@ create policy "session metrics select own"
 --    the UN-ARCHIVED TAIL still in segments. The full dataset is
 --    archive_manifest (joined to subjects for the live label) PLUS this tail.
 --    See STORAGE.md and model/DESIGN.md.
-
-drop view if exists public.v_training_segments;
 
 create view public.v_training_segments
 with (security_invoker = true) as
@@ -1185,12 +909,12 @@ select
     else null
   end                               as is_human,
   sub.kind                          as subject_kind,
-  -- Provenance. Audit-grade rather than load-bearing: see the header above.
+  -- Provenance. subjects_label_has_provenance is validated, so
+  -- `is_human is not null` already implies a deliberate label; these are
+  -- audit-grade rather than load-bearing.
   sub.kind_source                   as subject_kind_source,
   sub.cohort                        as subject_cohort,
   sub.labeled_at                    as subject_labeled_at,
-  -- So a training set is auditably consented without a second query.
-  sub.consent_version               as subject_consent_version,
   s.routine,
   s.difficulty,
   s.planned_duration_ms,

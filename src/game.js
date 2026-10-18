@@ -2,13 +2,14 @@ import { Euler, Raycaster, Vector2, Vector3 } from 'three';
 import { createRoutine } from './routines/index.js';
 import { configFor } from './difficulty.js';
 import { createTelemetry, buildSegmentPayload, buildSessionPayload } from './telemetry.js';
-import { insertSession, insertSegment } from './supabase.js';
+import { insertSession, insertSegment, closeSession } from './supabase.js';
 import {
   FEEDBACK_FLASH_MS,
   TRACK_WINDOW_MS,
   DEFAULT_ROUTINE,
   DEFAULT_DIFFICULTY,
-  SESSION_COMPLETE_FRACTION
+  SESSION_COMPLETE_FRACTION,
+  SESSION_MIN_PLAY_MS
 } from './constants.js';
 
 const SCREEN_CENTER = new Vector2(0, 0);
@@ -63,6 +64,20 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
   // insert having resolved. null between runs.
   let currentSessionId = null;
   let sessionStartMs = 0;
+  // The SESSION_MIN_PLAY_MS gate. Until the run crosses that threshold its
+  // session row and every segment it has produced sit HERE, in memory, and are
+  // discarded outright if the run ends first — so an abandoned 10-second run
+  // writes nothing at all.
+  //
+  // The two must be withheld TOGETHER. Releasing segments while holding the
+  // session row back would be worse than no gate at all: a segment carries the
+  // client-minted session_id, so it would reach the database with no session to
+  // reference, raise 23503, and be retried forever — outbox.js classifies a
+  // missing session as transient on purpose, because normally it just means the
+  // session insert has not landed yet. Here it would never land.
+  let sessionReleased = false;
+  let pendingSession = null;
+  let pendingSegments = [];
   // Resets ONLY in start(), which also mints a fresh session id. Never reset it
   // on resume: a re-used index collides with a pre-pause row on the unique
   // (session_id, segment_index), and the outbox cannot tell that collision apart
@@ -195,9 +210,34 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
     telemetry.beginSegment(now, snapshotBoard());
   }
 
+  // Crosses the SESSION_MIN_PLAY_MS threshold: the run has earned its place in
+  // the database, so the session row goes first and the segments buffered
+  // behind it follow in order. Called from update() on the frame the threshold
+  // is passed, and guarded so it can only ever fire once per run.
+  //
+  // Session before segments for the same reason initTelemetryOutbox() replays
+  // in that order — a segment arriving first is only a 23503 round trip, but
+  // there is no reason to take it.
+  function releaseSession() {
+    if (sessionReleased) return;
+    sessionReleased = true;
+
+    insertSession(pendingSession);
+    pendingSession = null;
+
+    for (const payload of pendingSegments) {
+      insertSegment(currentSessionId, payload);
+    }
+    pendingSegments = [];
+  }
+
   // Ships the segment that just closed. The frames/board references are read
   // before beginAttempt() swaps in fresh ones, so an in-flight insert keeps its
   // own array. An empty segment (no frame sampled yet) is never shipped.
+  //
+  // Before the gate opens the row is buffered instead of enqueued (see
+  // sessionReleased). segment_index is stamped here either way, so indices stay
+  // contiguous from 0 across the gate exactly as they do across a pause.
   function flushSegment(outcome, fields = {}) {
     const frames = telemetry.frames();
     if (frames.length === 0) return;
@@ -216,26 +256,26 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
       clickOffset = null
     } = fields;
 
-    insertSegment(
-      currentSessionId,
-      buildSegmentPayload({
-        segmentIndex: segmentIndex++,
-        startedAtMs: Math.round(attemptStart - sessionStartMs),
-        outcome,
-        targetDistance,
-        timeToClickMs,
-        dwellMs,
-        clickOffset,
-        targetCount: board.length,
-        targets: board,
-        engagedIndex: engagedIndexAtStart,
-        frames,
-        inputs,
-        // Static-target routines omit per-frame tx/ty/tz (sampling_version 4);
-        // `strafing` declares movesTargets and depends on this being kept.
-        movesTargets: routine.movesTargets === true
-      })
-    );
+    const payload = buildSegmentPayload({
+      segmentIndex: segmentIndex++,
+      startedAtMs: Math.round(attemptStart - sessionStartMs),
+      outcome,
+      targetDistance,
+      timeToClickMs,
+      dwellMs,
+      clickOffset,
+      targetCount: board.length,
+      targets: board,
+      engagedIndex: engagedIndexAtStart,
+      frames,
+      inputs,
+      // Static-target routines omit per-frame tx/ty/tz (sampling_version 1);
+      // `strafing` declares movesTargets and depends on this being kept.
+      movesTargets: routine.movesTargets === true
+    });
+
+    if (sessionReleased) insertSegment(currentSessionId, payload);
+    else pendingSegments.push(payload);
   }
 
   function flash(result) {
@@ -370,6 +410,13 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
         return;
       }
 
+      // The SESSION_MIN_PLAY_MS gate opens here, AFTER the expiry check above —
+      // which must keep its place at the top for the reason documented there.
+      // Any planned duration in SESSION_DURATIONS_MIN is far longer than the
+      // threshold, so a run that reaches its deadline has always been released
+      // well before; this only decides the fate of a run abandoned early.
+      if (sessionReleased === false && elapsed >= SESSION_MIN_PLAY_MS) releaseSession();
+
       hud.setTimeLeft(Math.ceil((plannedDurationMs - elapsed) / 1000));
 
       const events = routine.update(t);
@@ -419,23 +466,32 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
       sessionStartMs = now;
       segmentIndex = 0;
 
-      // Mint the session id here and open the session row with it. insertSession
-      // is fire-and-forget (durable: it queues to its own outbox and retries), so
-      // nothing blocks the game loop and a transient failure no longer loses the
-      // run. options.session carries the hardware block (dpi/sens/cm360, fov,
-      // refresh, device) from main.js. The id is NOT regenerated on pause/resume:
-      // one run is one session row.
+      // Mint the session id here and BUILD the session row, but do not enqueue
+      // it: it is held in pendingSession until the run passes
+      // SESSION_MIN_PLAY_MS (see releaseSession), and discarded in end() if it
+      // never does. options.session carries the hardware block (dpi/sens/cm360,
+      // fov, refresh, device) from main.js. The id is NOT regenerated on
+      // pause/resume: one run is one session row.
+      //
+      // Delivery is still fire-and-forget and durable once released —
+      // insertSession queues to its own IndexedDB-backed outbox and retries, so
+      // a transient failure does not lose the run.
       currentSessionId = newSessionId();
-      insertSession(
-        buildSessionPayload({
-          id: currentSessionId,
-          routine: routineId,
-          difficulty,
-          routineConfig: config,
-          plannedDurationMs,
-          ...(options.session ?? {})
-        })
-      );
+      sessionReleased = false;
+      pendingSegments = [];
+      pendingSession = buildSessionPayload({
+        id: currentSessionId,
+        routine: routineId,
+        difficulty,
+        routineConfig: config,
+        plannedDurationMs,
+        ...(options.session ?? {})
+      });
+
+      // Opens the session-scoped poll_hz histogram. Must be per RUN, not per
+      // segment — a per-segment median would be taken over about a second of
+      // samples and the run's figure would end up a median of medians.
+      telemetry.beginSession();
 
       hits = 0;
       attempts = 0;
@@ -515,6 +571,32 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
 
       const activeMs = Math.max(0, Math.round(endedAtMs));
 
+      // The gate's verdict. A run that never reached SESSION_MIN_PLAY_MS is
+      // dropped in full — the buffered session row and every segment behind it
+      // — and `saved: false` is what lets the results screen say so out loud.
+      // A discarded run that looked saved would be exactly the kind of silent
+      // loss this codebase is built to avoid.
+      if (sessionReleased === false) {
+        console.info(
+          `Run discarded: ${activeMs} ms of play is under the ${SESSION_MIN_PLAY_MS} ms ` +
+            `minimum, so no session row and none of its ${pendingSegments.length} segments were sent.`
+        );
+        pendingSession = null;
+        pendingSegments = [];
+      } else {
+        // Close the row: the one update the client may make. Fire-and-forget —
+        // closeSession logs its own failure and the offline backfill covers it,
+        // so there is nothing useful to await here. poll_hz comes from the
+        // session-wide histogram and is null if too few samples were seen.
+        closeSession(currentSessionId, {
+          endedAt: new Date().toISOString(),
+          pollHz: telemetry.pollHz()
+        });
+      }
+
+      const saved = sessionReleased;
+      currentSessionId = null;
+
       return {
         routineId,
         difficulty,
@@ -524,6 +606,9 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
         attempts,
         clicks,
         totalTimeMs,
+        // False when the run was too short to record at all (see the gate
+        // above). The results screen must surface this.
+        saved,
         // Shown to the player as progress, never persisted: the offline verdict
         // is computed from delivered segments and is the only record.
         completed:

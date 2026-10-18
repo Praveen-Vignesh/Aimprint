@@ -61,20 +61,26 @@ export const TRACK_WINDOW_MS = 1000;
 // sampler or difficulty.js silently mixes incomparable rows into one training
 // set. sampling_version tracks the shape AND the clock meaning that
 // sampleFrame() produces, and must be bumped whenever either changes — it
-// mirrors sessions.sampling_version.
+// mirrors sessions.sampling_version and is what stops a training pull silently
+// mixing rows produced by two different samplers. Filter on it in a pull rather
+// than assuming one shape.
 //
-// 3: timed sessions. The frame clock excludes paused time, so a segment's `t`
-//    and its started_at_ms are active-play milliseconds, not wall clock.
-// 4: storage-shrink encoding. input_events is delta-encoded as {t0, dt, dx, dy}
-//    with t0/dt in integer TENTHS of a millisecond (0.1 ms resolution, below the
-//    ~1 ms poll floor), and the per-frame tx/ty/tz columns are OMITTED for
-//    static-target routines (flick, spidershot) — the engaged target is
-//    stationary within a segment, so its position already lives in `targets`.
-//    Both are lossless in signal; both change the stored SHAPE, so the version
-//    moves and any v3 row is excluded from a v4 training pull rather than
-//    silently decoded wrong. Decoding lives only in the offline archive job.
+// Reset to 1 on 2026-10-18, when all collected data was deleted. There is no
+// version history to carry: every row in the database is v1 by construction.
+//
+// v1 is: a per-frame trajectory of {t, dx, dy, yaw, pitch, tx, ty, tz, on}
+// whose clock EXCLUDES paused time (so `t` and started_at_ms are active-play
+// milliseconds, not wall clock), with tx/ty/tz OMITTED for static-target
+// routines (flick, spidershot) because the engaged target does not move within
+// a segment and its position already lives in the `targets` snapshot; plus
+// input_events delta-encoded as {t0, dt, dx, dy} with t0/dt in integer TENTHS
+// of a millisecond (0.1 ms resolution, below the ~1 ms poll floor). Decoding
+// lives only in the offline archive job.
+//
+// APP_VERSION is a different axis and is NOT reset with this: it is the app's
+// own semver from package.json, and claiming the code is new would be a lie.
 export const APP_VERSION = typeof __APP_VERSION__ === 'string' ? __APP_VERSION__ : 'dev';
-export const SAMPLING_VERSION = 4;
+export const SAMPLING_VERSION = 1;
 
 // Fixed-duration sessions. The player picks one of these on the home screen and
 // it is stamped on the session row as planned_duration_ms — INTENT recorded at
@@ -95,7 +101,19 @@ export const MS_PER_MINUTE = 60000;
 // number the player sees disagrees with the number the pipeline records.
 export const SESSION_COMPLETE_FRACTION = 0.7;
 
-// The consent text version a signup agrees to, stamped on the profile (and
-// copied to the subject offline so it survives account deletion). Bump when the
-// wording materially changes so old consent is not silently treated as new.
-export const CONSENT_VERSION = 'v1-2026-09';
+// A run shorter than this writes NOTHING — no session row, no segments. Below
+// this a row is noise (a menu misclick, a few seconds spent looking at the
+// scene) that would still be counted in every per-subject progress query, and
+// nothing useful can be learned from three seconds of aim.
+//
+// The session row AND its segments are buffered in memory until the threshold
+// is crossed, then released together. Withholding only the session row would be
+// WORSE than not gating at all: segments carry a client-minted session_id, so
+// they would queue against a session that never arrives and retry 23503
+// forever — the outbox treats a missing session as transient on purpose
+// (see src/game.js releaseSession and src/outbox.js TRANSIENT_SQLSTATE).
+//
+// One minute is 20% of the shortest selectable session. Buffering costs about
+// 60 segments for a tracking routine or ~120 for a destructible one, well under
+// 1 MB.
+export const SESSION_MIN_PLAY_MS = 60000;

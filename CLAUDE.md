@@ -17,8 +17,10 @@ code but are **withheld** for the data-collection campaign (see the routines not
 The project is now at its **data-collection campaign**: a finite, one-off dataset of ~20 human
 contributors and ~5 bot variants (≈150 sessions), feeding two offline models — a bot detector
 and biometric identification. That finite framing drives the storage model (`STORAGE.md`) and
-the pre-collection hardening recorded in **`AUDIT-2026-10.md`**. The schema changes from that
-pass are in `schema.sql` but **not yet applied to the live database** (`LABELING.md` STATUS).
+the pre-collection hardening recorded in **`AUDIT-2026-10.md`**. On 2026-10-18 all collected
+data was wiped and `schema.sql` was rewritten as a single from-scratch DDL file (it is **not**
+a migration any more — see its header) and applied clean; `sampling_version` was reset to 1 in
+the same pass (`LABELING.md` STATUS).
 
 Alongside the game, an **offline Python pipeline is planned to live in `model/`**: it will
 pull telemetry back out of Supabase and train a human-vs-bot classifier. It is a separate
@@ -53,8 +55,9 @@ Adding a dependency or a framework *there* is a spec violation, not an improveme
 - Full v2 telemetry pipeline: session + segment tables, columnar per-frame trajectories,
   a durable IndexedDB-backed outbox with retry/backoff, and DPI-independent sensitivity
   tracking.
-- Real email/password + Google OAuth accounts (`src/supabase.js`), consent stamping, and
-  a hard sign-in gate — **playing requires an account; there is no free-run allowance.**
+- Real email/password + Google OAuth accounts (`src/supabase.js`) and a hard sign-in gate —
+  **playing requires an account; there is no free-run allowance.** (The separate consent step
+  was removed on 2026-10-18; agreement is now part of creating an account.)
 - The in-browser Bot Mode has been **removed entirely** — no `?bot=`, no `bot.js`.
 
 **Database (`schema.sql`) — the v2 shape, plus a label-integrity fix layered on top:**
@@ -240,7 +243,7 @@ a `[data-modal="open|close"]` convention, toggling a `modal-open` class on `<bod
 native cursor returns while the dialog is up. It closes on the dialog's own `close` event as
 well as the buttons, so `Esc` and a backdrop click restore the crosshair too. **`play.html`
 has no sign-in form on purpose** — it is past the gate, you arrive already signed in. A
-signed-out or unconsented visitor gets a notice linking back to `/` and a disabled Start.
+signed-out visitor gets a notice linking back to `/` and a disabled Start.
 A third copy of the form would mean three things to keep in sync for a page nobody signs in
 on.
 
@@ -352,13 +355,14 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   It is stamped on every `sessions` row and is the only thing that stops a training pull
   silently mixing rows produced by two different samplers. `APP_VERSION` comes free from
   `package.json` via `vite.config.js`; `SAMPLING_VERSION` is hand-maintained in
-  `constants.js`, so it is the one that gets forgotten. It is **4**: at 3 the frame clock
-  excludes paused time (`t`/`started_at_ms` are active-play ms); 4 adds the storage-shrink
-  encoding — `input_events` delta-encoded as `{t0, dt, dx, dy}` in integer tenths of a
-  millisecond, and per-frame `tx/ty/tz` omitted for static-target routines (flick, spidershot),
-  where the engaged target is stationary and its position already lives in the `targets` snapshot.
-  A `v3` row is a different shape and must be excluded from a v4 pull, never decoded with the v4
-  reader. Decoding lives only in the offline archive job (`STORAGE.md`, `model/DESIGN.md`).
+  `constants.js`, so it is the one that gets forgotten. It is **1**: it was reset from 4 on
+  2026-10-18 when all collected data was deleted, so there is no version history to carry and
+  every row in the database is v1 by construction. v1 is: the frame clock excludes paused time
+  (`t`/`started_at_ms` are active-play ms); `input_events` delta-encoded as `{t0, dt, dx, dy}`
+  in integer tenths of a millisecond; and per-frame `tx/ty/tz` omitted for static-target routines
+  (flick, spidershot), where the engaged target is stationary and its position already lives in
+  the `targets` snapshot. The rule still stands for any future change — bump it and filter on it
+  in a pull — but there is no older shape to exclude today. Decoding lives only in the offline archive job (`STORAGE.md`, `model/DESIGN.md`).
 - **A click in a tracking routine writes no row.** `trackingShot()` flashes the crosshair
   and moves the HUD's `hits`/`attempts`, but does not close a segment, does not touch
   `clicks`, and does not call `flushSegment` — tracking segments close only on the
@@ -417,9 +421,26 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   tracking-error signal. It is easy to confuse with the removed `board_trajectory` /
   `tracksBoardTrajectory` (the *non-engaged* targets' paths, which only the withheld `switching`
   ever wrote) — those are gone, `movesTargets` stays.
-- **Consent is a server-side insert precondition, not only a client gate.** The `sessions` insert
-  policy requires `current_consent_version() is not null`, so `canPlay()`/`applyStartGate()` are
-  now the UX layer over a database rule, not the only check.
+- **A run under `SESSION_MIN_PLAY_MS` (60 s) writes nothing, and the session row and its segments
+  must be withheld together.** `game.start()` builds the session payload and buffers it in
+  `pendingSession`; segments buffer in `pendingSegments`. `releaseSession()` (called from
+  `update()` once `elapsed` crosses the threshold) enqueues the session then replays the buffered
+  segments; `end()` before that point discards both and returns `saved: false`. Releasing
+  segments while holding the session back would be worse than no gate — a segment carries the
+  client-minted `session_id`, so it would hit the DB with no session to reference and retry
+  `23503` forever (the outbox treats a missing session as transient on purpose). The results
+  screen must surface `saved: false`, or a discarded run looks saved — the exact silent loss this
+  codebase is built to avoid.
+- **`sessions.ended_at` / `poll_hz` are written by the client ONCE, at run end, through the only
+  UPDATE policy in the schema.** `closeSession()` (`supabase.js`) PATCHes the row via
+  `sessions close own`, which is single-shot by construction: `using (ended_at is null)` stops
+  matching the moment the first close lands, and a column-level `grant update (ended_at, poll_hz)`
+  is what confines the write to those two columns (RLS cannot restrict columns). `ended_at` is a
+  client wall-clock and therefore forgeable — accepted because it is descriptive, never a model
+  feature, and `sessions_ended_at_sane` catches a broken one. `poll_hz` is the median pointer
+  inter-arrival measured in `telemetry.js` (`pollHz`), null below `POLL_MIN_SAMPLES`. Neither is
+  in the INSERT grant or the session payload — sending either at insert is a `42501` that drops
+  the whole row. If a close is lost, `queries/campaign.sql` §5 backfills both.
 
 ## Supabase
 
@@ -486,34 +507,16 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   rolling `refresh_hz` estimate off the render loop, coarse device fingerprint, plus
   `app_version`/`sampling_version`) and passes it to `game.start({ session })` alongside
   `plannedDurationMs`. It also owns the account panel wiring and the sign-in gate below.
-- **Consent is server state, and it gates play.** `profiles.consent_version` is the single
-  source of truth. `resolveSubjectFor()` reads it alongside `subject_id` (one query, the
-  `profiles select own` policy covers both), and it is published on the auth state as
-  `consented`. **`canPlay()` in `main.js` is `signed_in && consented === true`**;
-  `applyStartGate()` in `home.js` mirrors it. `consented === null` means the read is still
-  in flight and is treated as not-playable, never assumed either way.
-  - **No sign-in path stamps consent.** It is collected once from the consent block that
-    appears after a session exists — the first moment it can actually be written. An
-    earlier design called `recordConsent()` on every successful sign-in while the checkbox
-    only gated sign-**up** and Google, so consent was recorded for a path where nobody ever
-    ticked anything.
-  - **No localStorage flag tracks consent.** One used to, and it could not survive a magic
-    link opened on a different device from the one that requested it: no flag, no stamp,
-    and play continued regardless. Reading the column makes the rule unconditional.
-  - `refreshConsent()` guards against a race — a sign-out or a different sign-in landing
-    mid-flight would otherwise attach one account's consent to another's session.
-  - **`consented` compares against `CONSENT_VERSION`, not merely null-checks.** Bumping the
-    constant in `constants.js` therefore re-prompts every existing player. That is
-    intended: it is what stops agreement to superseded wording being silently honoured. Do
-    not weaken it to a presence check, and bump the version only on a material change.
-  - **A `profiles_mirror_consent` trigger copies consent onto `subjects`.** The client
-    writes only `profiles`, which is `on delete cascade` from `auth.users` — so deleting an
-    account used to destroy the sole record that consent was given while the telemetry it
-    authorised lived on. `subjects.consent_version`/`consented_at` exist to outlive that,
-    and nothing wrote them until this trigger; the guarantee in `schema.sql`'s `subjects`
-    comment was aspirational. It is `SECURITY DEFINER` (the client has no policy on
-    `subjects` and must not get one) and writes **only the two consent columns, never
-    `kind`**, so the default-deny label contract is untouched.
+- **There is no consent system (removed 2026-10-18), and the gate is a signed-in account and
+  nothing else.** `canPlay()` in `main.js` is `signed_in`; `applyStartGate()` in `home.js`
+  mirrors it, and the two must stay in step. What was removed, in full: `profiles.consent_version`
+  / `consented_at` and the matching `subjects` pair; `CONSENT_VERSION`; `recordConsent()` /
+  `refreshConsent()`; the `consented` field on the auth state; `current_consent_version()` and the
+  `consent` clause it fed in the `sessions` insert policy; the `mirror_consent_to_subject()`
+  trigger; and the consent checkbox block with its six `data-auth` hooks. **The `profiles update
+  own` policy went with it** — consent was its only purpose — so `profiles` is now read-only to
+  the client (`revoke update`, no grant after it). Agreement is now a line of copy on the sign-up
+  card: creating an account is the agreement. `privacy.html` explains it and is linked from there.
 - **Playing requires an account; there is no trial.** A `FREE_SESSION_LIMIT` trial used to
   precede the gate and was removed: it wrote nothing (no auth session, no subject to attach
   to), so every run it granted was play the project could not learn from — roughly twenty
@@ -536,25 +539,27 @@ is the binding constraint on the biometric model, so it is worth more than signu
 conversion. Two consequences, both fine and neither losing data:
 
 - A new signup has **no session** until the emailed link is clicked, so `signUp()` returns
-  `needsConfirmation: true` and `recordConsent()` defers to the later sign-in.
+  `needsConfirmation: true`.
 - The player cannot start a run until confirmed. Combined with there being no free-run
-  trial, **every run belongs to an authenticated subject and is saved** — there is no
-  unauthenticated run to lose.
+  trial, **every run belongs to an authenticated subject** — there is no unauthenticated run
+  to lose. (A run under `SESSION_MIN_PLAY_MS` is deliberately discarded, which is a different
+  thing: it is dropped on purpose, visibly, not lost.)
 
 Custom SMTP is live on `smtp.gmail.com:587` with a Gmail App Password. The built-in
 Supabase mailer is capped at **2 emails/hour** and is not usable for real signups; custom
 SMTP raises that to 30/hour by default (Authentication → Rate Limits). With no
 credentials or no signed-in account the game still runs and simply drops rows.
-`sessions.ended_at` and `poll_hz` are never written by the client: there is no update policy
-(append-only), and both are derived offline with the service key.
+`sessions.ended_at` and `poll_hz` are written by the client ONCE at run end through the
+single-shot `sessions close own` policy (see the invariant above); if that close is lost they
+are backfilled offline with the service key (`queries/campaign.sql` §5).
 
 **The v1 flat table has been dropped outright**, not merely renamed-and-ignored.
 `schema.sql` no longer renames or revokes on it, and **neither statement may be
 reinstated**: `REVOKE` has no `IF EXISTS` form, so revoking on a table that no longer
 exists fails with `42P01` and, because the whole file runs as one implicit transaction,
-rolls back the entire migration run.
+rolls back the entire run.
 
-**The v2 shape (what `schema.sql` defines).** Five tables, split because hardware and
+**The v2 shape (what `schema.sql` defines).** Six tables, split because hardware and
 settings are session-scoped while outcomes are segment-scoped:
 
 - `subjects` — the pseudonymous person, deliberately *not* `auth.users`. Deleting an
@@ -571,6 +576,8 @@ settings are session-scoped while outcomes are segment-scoped:
   alongside `trajectory` (per-frame, carries world state). They are not interchangeable.
 - `session_metrics` — derived aggregates, written offline with the service key, read by
   the player.
+- `archive_manifest` — the index of the offline Parquet archive (one row per archived
+  session, with the checksum that gated its prune). Service-key only, RLS-on-no-policy.
 
 Rules the v2 design encodes, worth preserving in any migration:
 
@@ -587,13 +594,15 @@ Rules the v2 design encodes, worth preserving in any migration:
   be written back into `kind`** —
   ground truth is what a person decided; a retrain that consumes its predecessor's guesses
   amplifies its own errors.
-- **Append-only on every telemetry table: no update or delete policy on `subjects`,
-  `sessions`, `segments` or `session_metrics`.** A behavioural reference set the account
-  holder can rewrite is not a reference set. The one update policy in the whole schema is
-  `profiles update own`, and its `with check` pins `subject_id` to `current_subject_id()`
-  so only the two consent columns are actually writable — that is what `recordConsent()`
-  in `supabase.js` uses. Do not widen it. (`subjects` carries **no policy at all**; there
-  are six policies in the file and no DELETE policy anywhere.)
+- **Append-only on every telemetry table, with ONE narrow exception: no delete policy
+  anywhere, and the only update policy is the single-shot `sessions close own`.** A
+  behavioural reference set the account holder can rewrite is not a reference set — so there is
+  no update policy on `subjects`, `segments`, `session_metrics` or (since consent was removed)
+  `profiles`. `sessions close own` exists only because `ended_at`/`poll_hz` cannot be known at
+  insert: `using (ended_at is null)` makes it fire at most once per row, and a column-level
+  `grant update (ended_at, poll_hz)` confines it to those two columns. Do not widen it, and do
+  not add a second update policy to any other table. (`subjects` carries **no policy at all**;
+  there are six policies in the file.)
 - **`segments` has no `select` policy at all.** Trajectories are the raw material of a
   biometric template, so an account cannot download its own reference data to replay it.
   Aggregates reach the player through `session_metrics`, and the training pull goes
@@ -608,8 +617,9 @@ Rules the v2 design encodes, worth preserving in any migration:
   values on the largest table means the planner never picks it, nothing queries it (there
   is no select policy, and the training pull filters on routine and label), and on an
   append-only table it concentrated every insert onto four hot leaf pages shared by all
-  concurrent writers. The three payload columns are also set to `lz4` compression — a
-  throughput change, not a disk one, since every one of those blobs is TOASTed on write.
+  concurrent writers. The two payload columns (`trajectory`, `input_events`) are also set to
+  `lz4` compression — a throughput change, not a disk one, since every one of those blobs is
+  TOASTed on write.
 
 **Two sets of credentials, and they must not cross.** The browser reads `.env.local`
 (`VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`) — a publishable key (`sb_publishable_...`)
@@ -626,12 +636,11 @@ bundle entirely.
 
 ## Label integrity
 
-The default-deny fix to `subjects.kind` is a schema change plus a manual operational
-runbook. The default-deny half is applied and validated against the live database; the one
-remaining step is labelling bot accounts and trusted human contributors, which cannot
-start before Phase 6 recruitment. **Note:** the later hardening (consent enforcement, merge
-guards, column grants, etc. — `AUDIT-2026-10.md`) is in `schema.sql` but **not yet applied to
-live** — re-paste `schema.sql` as one buffer and re-verify (`LABELING.md` STATUS addendum).
+The default-deny fix to `subjects.kind` is a schema property plus a manual operational
+runbook. Since the 2026-10-18 rewrite it is default-deny **by construction** — it is simply how
+the table is defined — and `subjects_label_has_provenance` is validated inline, so the old
+manual `validate constraint` step is gone. The one remaining step is labelling bot accounts and
+trusted human contributors, which cannot start before Phase 6 recruitment.
 
 **`LABELING.md` is the authority** — its STATUS block is the single place that answers "is
 the label fix actually live", and §5 has the exact statements. Read it before running any
@@ -643,7 +652,7 @@ Most of the earlier multi-user audit is now applied (**`AUDIT-2026-10.md`** is t
 remains:
 
 - **Storage is managed by archive-and-prune, and the archive job does not exist yet.** The
-  encoding shrink (`sampling_version` 4) plus 5-minute sessions put a 5-min session at ~2.6 MB, and
+  encoding shrink (`sampling_version` 1) plus 5-minute sessions put a 5-min session at ~2.6 MB, and
   the finite campaign (~150 sessions ≈ ~400 MB) fits Free **only if** `segments` is archived to
   Parquet and pruned before it passes ~150 MB (`STORAGE.md`). That archive job is the first
   unbuilt piece of `model/` (`src/TODO.md` §1). Watch `segments` size with
@@ -733,9 +742,9 @@ browsers, unrecoverably**; renaming the settings key silently resets everyone's 
 
 Two others were retired and no longer exist anywhere in `src/`:
 `'aim-trainer.free-sessions-used'` (with the free-run trial) and
-`'aim-trainer.pending-google-consent'` (with the localStorage consent flag, replaced by
-the `profiles.consent_version` gate). Values left behind in a returning visitor's
-localStorage are inert and never read.
+`'aim-trainer.pending-google-consent'` (with the localStorage consent flag — later replaced by
+a `profiles.consent_version` gate, which was itself removed with the whole consent system on
+2026-10-18). Values left behind in a returning visitor's localStorage are inert and never read.
 
 A future session seeing `Aimprint` in the UI and `aim-trainer` in storage is looking at a
 deliberate decision, not an oversight.
