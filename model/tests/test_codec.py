@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.codec import decode_input_events, decode_segment, require_v1  # noqa: E402
+from src.common.codec import decode_input_events, decode_segment, require_v1  # noqa: E402
 
 
 def _js_encode_input_events(inputs: list[dict]) -> dict:

@@ -68,6 +68,10 @@ IDENTITY_COLUMNS = [
     "segment_id", "session_id", "subject_id",
     "is_human", "subject_kind", "subject_cohort",
     "routine", "difficulty", "outcome",
+    # Carried for the biometric enrol/verify split (sessions ordered by day).
+    # Filtered by presence in build_segment_features, so fixtures without it are
+    # unaffected.
+    "session_started_at",
 ]
 
 # Emitted alongside the features but not themselves model inputs: the Fitts

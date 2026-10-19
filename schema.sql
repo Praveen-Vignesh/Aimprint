@@ -48,7 +48,7 @@
 -- migration — that is how it reached 1,232 lines the first time.
 --
 -- ===========================================================================
--- Six tables:
+-- Eight tables:
 --   subjects         — a pseudonymous person. Survives account deletion.
 --   profiles         — the link between an auth.users account and a subject.
 --                      Deleted with the account, which anonymises the telemetry.
@@ -58,6 +58,10 @@
 --                      model consumes.
 --   session_metrics  — derived aggregates, written offline with the service key.
 --   archive_manifest — the index of the offline Parquet archive (STORAGE.md).
+--   predictions      — model guesses about a subject (service-key only). Added
+--                      2026-10-19 (migrations/2026-10-19-predictions.sql).
+--   biometric_templates — per-subject biometric signature (service-key only).
+--                      Added 2026-10-19 (migrations/2026-10-19-biometric-templates.sql).
 --
 -- Plus v_training_segments, a view (not a table) that the offline pipeline
 -- reads with the service key.
@@ -649,6 +653,54 @@ create table public.archive_manifest (
 );
 
 -- ---------------------------------------------------------------------------
+-- predictions
+-- ---------------------------------------------------------------------------
+-- Model guesses about a subject, written offline by model/src/score.py with the
+-- service key. This is the SEPARATE home for predictions — never session_metrics
+-- (the player can read their own row there and would see their bot-score) and
+-- never subjects.kind (human-decided ground truth; a retrain consuming its own
+-- past guesses amplifies its errors). Added live via
+-- migrations/2026-10-19-predictions.sql; this is the mirror for a from-scratch
+-- rebuild. Service-key only: RLS on, zero policies, same posture as
+-- archive_manifest. (model_version) is part of the PK so re-scoring APPENDS.
+create table public.predictions (
+  subject_id        uuid not null references public.subjects(subject_id) on delete cascade,
+  model_version     text not null,
+  scored_at         timestamptz not null default now(),
+  bot_probability   double precision not null
+    constraint predictions_prob_range check (bot_probability >= 0 and bot_probability <= 1),
+  predicted_label   text not null
+    constraint predictions_label_allowed check (predicted_label in ('human', 'synthetic')),
+  n_segments        int not null constraint predictions_n_segments_positive check (n_segments > 0),
+  features_version  int not null default 1,
+  notes             jsonb,
+  primary key (subject_id, model_version)
+);
+
+-- ---------------------------------------------------------------------------
+-- biometric_templates
+-- ---------------------------------------------------------------------------
+-- Per-subject behavioural-biometric signature for the (deploy-ready) auth gate,
+-- built offline from a subject's enrol sessions by model/src/biometric/enrol.py.
+-- Added live via migrations/2026-10-19-biometric-templates.sql; this is the
+-- mirror for a from-scratch rebuild.
+--
+-- SECURITY: RLS on, zero policies, service-key only. A client that could read
+-- its own template could replay it to defeat verification, so this table is
+-- NEVER client-readable — the opposite of the usual "read your own rows"
+-- posture, deliberately. Behavioural biometric auth at campaign scale is a
+-- secondary risk signal, never a sole auth factor.
+create table public.biometric_templates (
+  subject_id        uuid primary key references public.subjects(subject_id) on delete cascade,
+  template_version  text not null,
+  enrolled_at       timestamptz not null default now(),
+  signature         jsonb not null,
+  n_enrol_sessions  int not null
+    constraint biometric_templates_n_enrol_sessions_nonneg check (n_enrol_sessions >= 0),
+  features_version  int not null default 1
+);
+
+-- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------
 -- The training pull is "every segment for these subjects, in order"; the app
@@ -685,6 +737,9 @@ create index subjects_kind_idx
 -- same contention that keeps segments_outcome_idx permanently unbuilt.
 create index segments_created_at_brin
   on public.segments using brin (created_at);
+-- "which subjects did this model flag" — the one read the operator makes.
+create index predictions_model_label_idx
+  on public.predictions (model_version, predicted_label);
 
 -- ---------------------------------------------------------------------------
 -- Row level security
@@ -707,6 +762,12 @@ alter table public.session_metrics  enable row level security;
 -- only with the service key by the offline archive job. RLS-on-no-policy denies
 -- the client everything, which is the whole intent.
 alter table public.archive_manifest enable row level security;
+-- predictions: RLS on, NO policy of any kind — service-key only, so a suspected
+-- bot can never read its own score and adapt. Same posture as archive_manifest.
+alter table public.predictions      enable row level security;
+-- biometric_templates: RLS on, NO policy — service-key only. A readable template
+-- is a replayable one; this table must never be client-readable.
+alter table public.biometric_templates enable row level security;
 
 -- subjects: no client policy of any kind. `kind` in particular must stay
 -- unwritable, or a synthetic run could relabel itself human. Model predictions

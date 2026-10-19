@@ -31,8 +31,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.codec import decode_segment  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.common.codec import decode_segment  # noqa: E402
 
 VIEW = "v_training_segments"
 PAGE_SIZE = 1000  # PostgREST caps a single response here regardless
@@ -46,7 +46,7 @@ LABEL_KINDS = {
 
 
 def _client():
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env")
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_KEY")
     if not url or not key:
@@ -56,7 +56,7 @@ def _client():
     return create_client(url, key)
 
 
-def _page(client, kinds, sampling_version, routine, cursor):
+def _page(client, kinds, sampling_version, routine, cursor, subject_ids=None):
     """One keyset page. `cursor` is (created_at, segment_id) of the last row of
     the previous page, or None for the first page."""
     q = (
@@ -65,6 +65,8 @@ def _page(client, kinds, sampling_version, routine, cursor):
         .in_("subject_kind", kinds)
         .eq("sampling_version", sampling_version)
     )
+    if subject_ids:
+        q = q.in_("subject_id", subject_ids)
     if routine:
         q = q.eq("routine", routine)
     if cursor is not None:
@@ -92,13 +94,16 @@ def _decode_row(row: dict) -> dict:
     return row
 
 
-def fetch(routine: str | None, label: str, sampling_version: int) -> pd.DataFrame:
+def fetch_core(kinds, routine=None, sampling_version=1, subject_ids=None) -> pd.DataFrame:
+    """Paginate the view for the given subject kinds (and optional subject-id
+    filter), decoding every row. Reused by the scoring path, which passes
+    kinds=['unknown'] (or a specific subject) — exactly the rows the training
+    fetch excludes."""
     client = _client()
-    kinds = LABEL_KINDS[label]
     cursor = None
     out_rows = []
     while True:
-        page = _page(client, kinds, sampling_version, routine, cursor)
+        page = _page(client, kinds, sampling_version, routine, cursor, subject_ids)
         if not page:
             break
         for row in page:
@@ -109,6 +114,10 @@ def fetch(routine: str | None, label: str, sampling_version: int) -> pd.DataFram
         cursor = (last["segment_created_at"], last["segment_id"])
         print(f"  ...{len(out_rows)} rows")
     return pd.DataFrame(out_rows)
+
+
+def fetch(routine: str | None, label: str, sampling_version: int) -> pd.DataFrame:
+    return fetch_core(LABEL_KINDS[label], routine, sampling_version)
 
 
 def main():
