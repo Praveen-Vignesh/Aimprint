@@ -126,6 +126,45 @@ backoff, mirrored to IndexedDB, replayed on the next page load, and scoped to th
 signed-in account so a shared machine never ships one participant's rows under
 another's login — so a network blip never loses recorded play.
 
+## Biometric verification (deployed model)
+
+The one piece of the project that is a **deployed, app-facing ML model**: a
+behavioural-biometric verifier served from `model/serving/` (FastAPI) and called
+by the game after a qualifying run ends. When a saved, signed-in session
+finishes, the browser POSTs that session's segments to the service's `/verify`
+endpoint; the service reads the subject's enrolled template **server-side with
+the service key** (the template never reaches the browser — a client-readable
+template would be replayable) and returns a trust result, shown as a quiet badge
+on the results screen.
+
+**It is a secondary signal only — never a sole authentication factor, and never a
+gate.** Playing does not depend on it (`canPlay()` is untouched), and at this data
+scale it is a research/capability demonstration, not a security control. Behaviour
+drifts with fatigue, hardware and mood, so false rejects are expected. The badge,
+the endpoint response, and this note all say so on purpose.
+
+If `VITE_VERIFY_URL` is unset the feature is silently off (no badge, no error) —
+the same spirit as running with no Supabase credentials. The live badge reads
+"not enough history yet" until the subject is **enrolled** (`model/src/biometric/
+enrol.py` writes a template with the service key) against a **trained** verifier
+artifact; both require collected human data first.
+
+**Deploying the service (Railway):**
+
+1. Build from `model/serving/Dockerfile` with the **repository root** as the build
+   context (the Dockerfile `COPY`s `model/src` and `model/models`).
+2. Set the service env vars `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` (the service
+   key lives only here and in `model/.env`, never in the browser bundle).
+3. **Pickle portability is the one gotcha:** a joblib artifact must be produced on
+   the same Python/numpy/sklearn stack that serves it. The image is `python:3.13`;
+   training currently runs on 3.15. Train the verifier inside the serving image
+   (or pin both stacks) before deploying — see the note at the top of the
+   Dockerfile.
+4. Point the browser at it: set `VITE_VERIFY_URL` in `.env.local` to the service
+   origin (bare, no `/verify` suffix) and rebuild. Add the site origin to the
+   service's CORS allow-list if it differs from the defaults in
+   `model/src/serving/app.py` (via `CORS_ALLOW_ORIGINS`).
+
 ## Notes
 
 - Sensitivity is set on the home screen (mouse DPI + in-game sens on the Valorant

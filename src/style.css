@@ -230,6 +230,47 @@ section {
   color: var(--color-accent-soft);
 }
 
+/* Post-session behavioural-biometric trust badge (results screen). Decorative,
+   non-blocking, and experimental — styled quietly so it never reads as a hard
+   verdict. */
+.verify-badge {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 4px;
+  background: var(--color-surface-sunken);
+}
+
+/* .hidden is a bare class, so this .verify-badge's own display: flex would
+   out-cascade it on source order and make the badge impossible to hide. Pair
+   them, exactly as .screen.hidden / .account-row.hidden do. */
+.verify-badge.hidden {
+  display: none;
+}
+
+.verify-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.verify-caption {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-text-dim);
+}
+
+.verify-badge.match .verify-label {
+  color: var(--color-hit);
+}
+
+.verify-badge.mismatch .verify-label {
+  color: var(--color-accent-soft);
+}
+
 /* Routine grid */
 
 .mode-grid {

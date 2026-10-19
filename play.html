@@ -121,6 +121,13 @@
       <div class="field"><span class="muted">Avg time</span><strong id="result-avg-time">&mdash;</strong></div>
       <button id="results-menu-button" class="primary">Back to menu</button>
       <p id="result-note" class="note"></p>
+      <!-- Behavioural-biometric trust badge, filled asynchronously by the
+           post-session verify call. Hidden unless there is something to show.
+           A SECONDARY signal only — never a sign-in gate (see verify-client.js). -->
+      <div id="result-verify" class="verify-badge hidden">
+        <span id="result-verify-label" class="verify-label">&mdash;</span>
+        <span class="verify-caption">Experimental play-style check — a secondary signal, never a sign-in factor.</span>
+      </div>
     </div>
   </div>
 

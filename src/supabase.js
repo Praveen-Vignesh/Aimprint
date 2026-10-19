@@ -519,6 +519,16 @@ export function flushTelemetryKeepalive() {
 // cannot satisfy RLS and there is nothing to deliver, so it is skipped. In the
 // normal path the game only starts for a signed-in account, so auth resolves;
 // this guards the edge where it does not.
+// The signed-in account's pseudonymous subject_id, or null when not resolvable
+// (not signed in, Supabase unconfigured, or the profile row has not resolved).
+// The browser names the subject in the post-session biometric verify call; it
+// never reads or writes the service-key-only biometric_templates table itself.
+// Reuses ensureAuth()'s resolution so it costs no extra round trip mid-run.
+export async function getSubjectId() {
+  const auth = await ensureAuth();
+  return auth === null ? null : auth.subjectId;
+}
+
 export async function insertSession(payload) {
   if (sessionOutbox === null) return;
 

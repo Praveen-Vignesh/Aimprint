@@ -15,8 +15,10 @@ import {
   validateSession,
   initTelemetryOutbox,
   flushTelemetry,
-  flushTelemetryKeepalive
+  flushTelemetryKeepalive,
+  getSubjectId
 } from './supabase.js';
+import { verifySession, VERIFY_STATES } from './verify-client.js';
 import {
   MOUSE_COUNT_SCALE,
   CAMERA_FOV,
@@ -84,6 +86,33 @@ function finishRun() {
   controls.unlock();
   home.renderResults(summary);
   home.setScreen('results');
+
+  // Post-session behavioural-biometric verification: a SECONDARY, decorative
+  // signal, never a gate (canPlay() is untouched). Fired non-blocking after the
+  // results are already on screen — the badge fills in when the call resolves,
+  // and the render loop is never awaited on it.
+  maybeVerifySession(summary);
+}
+
+// Sends the finished session's segments to the deployed /verify endpoint and
+// drives the results-screen trust badge. No-op unless the run was actually saved
+// and the player is signed in; stays silent on any failure (verify-client maps
+// network/unconfigured to a hidden badge).
+function maybeVerifySession(summary) {
+  if (summary === null || summary.saved !== true || canPlay() === false) return;
+  const segments = summary.segments ?? [];
+  if (segments.length === 0) return;
+
+  home.setVerifyState(VERIFY_STATES.CHECKING);
+  (async () => {
+    const subjectId = await getSubjectId();
+    if (subjectId === null) {
+      home.setVerifyState(VERIFY_STATES.OFF);
+      return;
+    }
+    const state = await verifySession({ subjectId, segments });
+    home.setVerifyState(state);
+  })();
 }
 
 // ---------------------------------------------------------------------------

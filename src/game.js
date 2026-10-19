@@ -78,6 +78,13 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
   let sessionReleased = false;
   let pendingSession = null;
   let pendingSegments = [];
+  // A session-scoped copy of every segment payload, kept for the post-session
+  // biometric verify call (src/verify-client.js). Separate from pendingSegments
+  // and the outbox: once the run is released, segments go STRAIGHT to the outbox
+  // and are not retained anywhere else, so there is no single in-memory array of
+  // the whole session to hand the verifier without this. Reset in start(),
+  // appended in flushSegment(), and returned by end() ONLY when the run is saved.
+  let sessionSegments = [];
   // Resets ONLY in start(), which also mints a fresh session id. Never reset it
   // on resume: a re-used index collides with a pre-pause row on the unique
   // (session_id, segment_index), and the outbox cannot tell that collision apart
@@ -276,6 +283,10 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
 
     if (sessionReleased) insertSegment(currentSessionId, payload);
     else pendingSegments.push(payload);
+
+    // Retain a copy for the post-session verify call regardless of the gate —
+    // end() decides whether to expose it, based on `saved`.
+    sessionSegments.push(payload);
   }
 
   function flash(result) {
@@ -479,6 +490,7 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
       currentSessionId = newSessionId();
       sessionReleased = false;
       pendingSegments = [];
+      sessionSegments = [];
       pendingSession = buildSessionPayload({
         id: currentSessionId,
         routine: routineId,
@@ -586,6 +598,13 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
       const saved = sessionReleased;
       currentSessionId = null;
 
+      // Only a saved run's segments are exposed for verification — a discarded
+      // run is dropped in full, and offering its segments would contradict that.
+      // The caller (main.js finishRun) passes these to the biometric verify
+      // call; they are the exact wire payloads that landed in the DB.
+      const segments = saved ? sessionSegments : [];
+      sessionSegments = [];
+
       return {
         routineId,
         difficulty,
@@ -595,6 +614,7 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
         attempts,
         clicks,
         totalTimeMs,
+        segments,
         // False when the run was too short to record at all (see the gate
         // above). The results screen must surface this.
         saved,

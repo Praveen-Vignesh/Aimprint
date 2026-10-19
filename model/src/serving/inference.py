@@ -15,9 +15,40 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.common import fetch_telemetry, registry  # noqa: E402
+from src.common.codec import decode_segment  # noqa: E402
 from src.common.features import build_segment_features  # noqa: E402
 
 TEMPLATES_TABLE = "biometric_templates"
+
+
+def _decoded_frame(raw_segments: list[dict] | pd.DataFrame) -> pd.DataFrame:
+    """Turn raw browser/DB segments into the decoded frame build_segment_features
+    expects. This is the step the endpoints were missing: the browser sends the
+    sampling_version=1 WIRE shape (delta-encoded input_events, columnar
+    trajectory with tx/ty/tz omitted for static routines), identical to a DB row,
+    and it must be run through codec.decode_segment before any feature is read —
+    exactly as fetch_telemetry does for the training pull.
+
+    A DataFrame already carrying decoded frames (the evaluation/test path) is
+    passed straight through: a decoded trajectory is a dict with a float 't_ms'
+    in input_events and no top-level t0/dt, so decoding again would fail. We key
+    off the wire marker instead — raw input_events carry 't0'/'dt'.
+
+    sampling_version lives on the sessions row, not the segment, so a browser
+    segment omits it; default it to 1 here (decode_segment still refuses any
+    other value a caller sets explicitly).
+    """
+    if isinstance(raw_segments, pd.DataFrame):
+        return raw_segments
+    decoded_rows = []
+    for seg in raw_segments:
+        row = dict(seg)
+        row.setdefault("sampling_version", 1)
+        decoded = decode_segment(row)
+        row["trajectory"] = decoded["trajectory"]
+        row["input_events"] = decoded["input_events"]
+        decoded_rows.append(row)
+    return pd.DataFrame(decoded_rows)
 
 
 def load_bot_detector(version: str | None = None):
@@ -29,9 +60,8 @@ def load_biometric(version: str | None = None):
 
 
 def score_bot(detector, raw_segments: list[dict] | pd.DataFrame) -> list[dict]:
-    """Raw decoded segments in → per-subject bot verdicts out."""
-    df = raw_segments if isinstance(raw_segments, pd.DataFrame) else pd.DataFrame(raw_segments)
-    feats = build_segment_features(df)
+    """Raw wire-format segments in → per-subject bot verdicts out."""
+    feats = build_segment_features(_decoded_frame(raw_segments))
     return detector.subject_predict(feats).to_dict(orient="records")
 
 
@@ -49,8 +79,7 @@ def get_template(subject_id: str) -> dict | None:
 def verify(verifier, template: dict, raw_segments: list[dict] | pd.DataFrame) -> dict:
     """Distance of a verify session to a claimed template → accept/reject. A
     SECONDARY signal only — never a standalone auth decision."""
-    df = raw_segments if isinstance(raw_segments, pd.DataFrame) else pd.DataFrame(raw_segments)
-    feats = build_segment_features(df)
+    feats = build_segment_features(_decoded_frame(raw_segments))
     distance = verifier.distance(template, feats)
     return {
         "distance": distance,

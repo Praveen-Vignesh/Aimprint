@@ -15,12 +15,29 @@ signal behind a real auth method.
 
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from src.serving import inference
 
 app = FastAPI(title="Aimprint models", version="1")
+
+# The browser calls /verify cross-origin (the game is on Vercel, this serves on
+# Railway), so the site origin must be allow-listed or the fetch is blocked. Only
+# POST is needed and no cookies cross, so credentials stay off. Extra origins can
+# be added via CORS_ALLOW_ORIGINS (comma-separated) without a code change.
+_DEFAULT_ORIGINS = ["https://aimprint.vercel.app", "http://localhost:5173"]
+_extra = [o.strip() for o in os.environ.get("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_DEFAULT_ORIGINS + _extra,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 # Loaded lazily so the app starts (and /health answers) even before any model is
 # trained — each endpoint reports clearly if its artifact is missing.

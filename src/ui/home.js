@@ -2,6 +2,7 @@ import { ROUTINES, routineById } from '../routines/index.js';
 import { DIFFICULTY_LEVELS } from '../difficulty.js';
 import { createSensitivity } from '../sensitivity.js';
 import { formatClock } from '../hud.js';
+import { VERIFY_STATES } from '../verify-client.js';
 import {
   SESSION_DURATIONS_MIN,
   SESSION_COMPLETE_FRACTION,
@@ -47,10 +48,24 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
   const resultAccuracy = document.getElementById('result-accuracy');
   const resultAvgTime = document.getElementById('result-avg-time');
   const resultNote = document.getElementById('result-note');
+  const resultVerify = document.getElementById('result-verify');
+  const resultVerifyLabel = document.getElementById('result-verify-label');
 
   const modeButtons = new Map();
   const difficultyButtons = new Map();
   const durationButtons = new Map();
+
+  // Results-screen trust badge copy, keyed by verify-client state. States not
+  // listed here (OFF, UNAVAILABLE) hide the badge entirely — a network failure
+  // or an unconfigured endpoint stays silent, same as "no Supabase creds → the
+  // app still runs". The 'match'/'mismatch' classes drive the label colour.
+  const VERIFY_COPY = {
+    [VERIFY_STATES.CHECKING]: { text: 'Checking your play style…', cls: '' },
+    [VERIFY_STATES.MATCH]: { text: 'Play style matches your history', cls: 'match' },
+    [VERIFY_STATES.MISMATCH]: { text: 'Play style differs from your usual', cls: 'mismatch' },
+    [VERIFY_STATES.NOT_ENOUGH_HISTORY]: { text: 'Not enough of your history yet to check', cls: '' },
+    [VERIFY_STATES.MODEL_NOT_READY]: { text: 'Style check isn’t available yet', cls: '' }
+  };
 
   // Latest input to the Start gate, so a settings-only re-render does not need
   // it threaded through.
@@ -199,6 +214,13 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
     renderResults(summary) {
       if (summary === null) return;
 
+      // Reset the trust badge to hidden on every render; finishRun drives it to
+      // 'checking' and then the resolved state only for a saved, signed-in run.
+      if (resultVerify) {
+        resultVerify.classList.add('hidden');
+        resultVerify.classList.remove('match', 'mismatch');
+      }
+
       const { routineId, difficulty, plannedMs, activeMs } = summary;
       const { hits, attempts, clicks, totalTimeMs, completed, saved } = summary;
       const name = routineById(routineId)?.name ?? routineId;
@@ -226,6 +248,23 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
           ? `Session complete — you passed the ${percent}% mark.`
           : `Under the ${percent}% mark, so this run does not count as complete.`;
       }
+    },
+
+    // Drives the post-session trust badge. Called first with 'checking' and
+    // then with the resolved verify-client state. OFF/UNAVAILABLE (and any
+    // unknown state) hide the badge, keeping an unreachable or unconfigured
+    // endpoint silent.
+    setVerifyState(state) {
+      if (!resultVerify) return;
+      const copy = VERIFY_COPY[state];
+      resultVerify.classList.remove('match', 'mismatch');
+      if (!copy) {
+        resultVerify.classList.add('hidden');
+        return;
+      }
+      resultVerifyLabel.textContent = copy.text;
+      if (copy.cls) resultVerify.classList.add(copy.cls);
+      resultVerify.classList.remove('hidden');
     },
 
     setScreen(screen) {
