@@ -26,7 +26,7 @@ from src.serving import inference
 app = FastAPI(title="Aimprint models", version="1")
 
 # The browser calls /verify cross-origin (the game is on Vercel, this serves on
-# Railway), so the site origin must be allow-listed or the fetch is blocked. Only
+# Render), so the site origin must be allow-listed or the fetch is blocked. Only
 # POST is needed and no cookies cross, so credentials stay off. Extra origins can
 # be added via CORS_ALLOW_ORIGINS (comma-separated) without a code change.
 _DEFAULT_ORIGINS = ["https://aimprint.vercel.app", "http://localhost:5173"]

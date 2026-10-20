@@ -149,21 +149,31 @@ the same spirit as running with no Supabase credentials. The live badge reads
 enrol.py` writes a template with the service key) against a **trained** verifier
 artifact; both require collected human data first.
 
-**Deploying the service (Railway):**
+**Deploying the service (Render, free plan):**
 
-1. Build from `model/serving/Dockerfile` with the **repository root** as the build
-   context (the Dockerfile `COPY`s `model/src` and `model/models`).
-2. Set the service env vars `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` (the service
-   key lives only here and in `model/.env`, never in the browser bundle).
+The repo ships a [`render.yaml`](render.yaml) Blueprint, so Render provisions the
+service from it directly.
+
+1. In Render: **New → Blueprint**, connect this GitHub repo. Render reads
+   `render.yaml` and builds `model/serving/Dockerfile` with the **repository root**
+   as the build context (the Dockerfile `COPY`s `model/src` and `model/models`).
+2. Set the service env vars `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` in the Render
+   dashboard (the service key lives only here and in `model/.env`, never in the
+   browser bundle). Optionally `CORS_ALLOW_ORIGINS` for extra origins.
 3. **Pickle portability is the one gotcha:** a joblib artifact must be produced on
    the same Python/numpy/sklearn stack that serves it. The image is `python:3.13`;
    training currently runs on 3.15. Train the verifier inside the serving image
    (or pin both stacks) before deploying — see the note at the top of the
    Dockerfile.
-4. Point the browser at it: set `VITE_VERIFY_URL` in `.env.local` to the service
-   origin (bare, no `/verify` suffix) and rebuild. Add the site origin to the
-   service's CORS allow-list if it differs from the defaults in
-   `model/src/serving/app.py` (via `CORS_ALLOW_ORIGINS`).
+4. Point the browser at it: set `VITE_VERIFY_URL` to the service origin (bare, no
+   `/verify` suffix) — in `.env.local` for local dev, and in the Vercel project's
+   environment variables for production (Vite inlines it at build time, so the
+   production site must be rebuilt after setting it).
+
+A free Render web service spins down after ~15 min idle and wakes in ~1 min. The
+game sends a warm-up ping to `/health` when a run **starts**, so the service is
+awake well before the post-session verify call fires — the cold start never lands
+on the player.
 
 ## Notes
 

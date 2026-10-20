@@ -1,0 +1,37 @@
+# Render Blueprint for the biometric verify service. Render reads this at the
+# repo root and provisions the service from it (Dashboard: New → Blueprint).
+#
+# Free plan notes:
+#   * A free web service spins down after ~15 min idle and wakes in ~1 min. The
+#     game fires a warm-up ping to /health when a RUN STARTS (src/main.js), so by
+#     the time the post-session verify call fires minutes later the service is
+#     already awake — the cold start never lands on the user.
+#   * The image serves Python 3.13; a joblib artifact must be trained on that same
+#     stack (see model/serving/Dockerfile). Until one exists the service is live
+#     and healthy, and /verify honestly returns 503/404.
+services:
+  - type: web
+    name: aimprint-verify
+    runtime: docker
+    plan: free
+    # Build the existing Dockerfile with the REPO ROOT as context — it COPYs
+    # model/serving/requirements.txt, model/src and model/models, all repo-root
+    # relative.
+    dockerfilePath: ./model/serving/Dockerfile
+    dockerContext: .
+    # Render injects $PORT and routes to it; the Dockerfile's own CMD hardcodes
+    # 8000, so override it here to bind the port Render expects.
+    dockerCommand: uvicorn src.serving.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      # Secrets — set these in the Render dashboard, never commit them. The
+      # service_role key is read server-side to fetch templates; it must never
+      # reach the browser bundle.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      # Optional extra CORS origins (comma-separated) beyond the built-in
+      # https://aimprint.vercel.app + http://localhost:5173.
+      - key: CORS_ALLOW_ORIGINS
+        sync: false

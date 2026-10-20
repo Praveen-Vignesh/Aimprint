@@ -1,7 +1,7 @@
 // Post-session behavioural-biometric verification client.
 //
 // When a qualifying run ends, the browser POSTs that session's segment payloads
-// to the deployed FastAPI /verify endpoint (Railway). The endpoint reads the
+// to the deployed FastAPI /verify endpoint (Render). The endpoint reads the
 // subject's template SERVER-SIDE with the service key and returns a trust
 // result. The template never leaves the server — that is the one property that
 // makes this defensible, so there is deliberately no client-side comparison here.
@@ -34,6 +34,24 @@ function defaultVerifyUrl() {
   } catch {
     return null;
   }
+}
+
+// Fire-and-forget wake-up ping, sent when a run STARTS. A free-tier host (Render)
+// spins the service down after idle and takes ~1 min to wake; the verify call
+// only fires at run END, minutes later, so pinging /health now means the service
+// is already awake by then and the cold start never lands on the user. Silent
+// and best-effort: no await, no throw, no-op when unconfigured.
+export function warmVerifyService({
+  url = defaultVerifyUrl(),
+  fetchImpl = typeof fetch === 'function' ? fetch : null
+} = {}) {
+  if (!url || !fetchImpl) return;
+  const endpoint = `${url.replace(/\/$/, '')}/health`;
+  // Deferred into a microtask so even a synchronous throw from fetchImpl becomes
+  // a caught rejection — never surfacing to the caller or the render loop.
+  Promise.resolve()
+    .then(() => fetchImpl(endpoint, { method: 'GET', cache: 'no-store' }))
+    .catch(() => {});
 }
 
 // Verifies one finished session. Returns a VERIFY_STATES value; never throws and

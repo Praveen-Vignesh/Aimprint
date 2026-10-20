@@ -18,7 +18,7 @@ import {
   flushTelemetryKeepalive,
   getSubjectId
 } from './supabase.js';
-import { verifySession, VERIFY_STATES } from './verify-client.js';
+import { verifySession, warmVerifyService, VERIFY_STATES } from './verify-client.js';
 import {
   MOUSE_COUNT_SCALE,
   CAMERA_FOV,
@@ -297,6 +297,11 @@ controls.addEventListener('lock', () => {
     session: sessionInfo(),
     plannedDurationMs: duration * MS_PER_MINUTE
   });
+
+  // Wake the (free-tier, idle-spun-down) verify service now, at run start, so it
+  // is warm by the time the post-session verify call fires minutes from now.
+  // Fire-and-forget; no-op when VITE_VERIFY_URL is unset.
+  warmVerifyService();
 });
 
 controls.addEventListener('unlock', () => {
