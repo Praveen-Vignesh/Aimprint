@@ -1,14 +1,17 @@
 """Biometric evaluation: the Equal Error Rate (EER) from genuine vs impostor
-verification distances, using an enrol-early / verify-late split BY CALENDAR DAY.
+verification distances, using an enrol-early / verify-late split BY SESSION ORDER.
 
-Protocol (DESIGN.md): a subject's earliest sessions enrol a template; their
-later sessions ON A STRICTLY LATER CALENDAR DAY are the genuine verify trials;
-every OTHER subject's verify sessions scored against that template are impostor
-trials. Verifying on a later day is the whole point — same-day sessions share
-warm-up/seating state a model can mistake for identity, so a cross-day split is
-what proves it learned the person, not the sitting. A subject with only one day
-of data cannot be a cross-day verify trial and is skipped (honestly) rather than
-verified against itself within the day.
+Protocol: a subject's earliest sessions enrol a template; their remaining
+sessions are the genuine verify trials; every OTHER subject's verify sessions
+scored against that template are impostor trials.
+
+⚠️ The cross-day requirement was REMOVED by request. Enrol and verify may now
+fall on the same calendar day. That weakens the metric's meaning: same-day
+sessions share warm-up/seating/input state a distance model can learn AS
+identity, so a same-day EER does not prove the model learned the PERSON rather
+than the SITTING. Every number this produces is a plumbing / demonstration
+metric, not a generalisation claim. (The original protocol required a strictly
+later verify day precisely to rule this out.)
 
 EER is reported via LEAVE-ONE-SUBJECT-OUT: for each held-out subject the operating
 threshold is calibrated on the OTHER subjects' trials and then applied to the
@@ -43,18 +46,10 @@ def _session_order(sub_df: pd.DataFrame) -> list:
     return list(order.index)
 
 
-def _session_dates(sub_df: pd.DataFrame) -> dict:
-    """{session_id: calendar date} for one subject (None where unparseable)."""
-    t = pd.to_datetime(sub_df["session_started_at"], errors="coerce")
-    by = sub_df.assign(_t=t).groupby("session_id")["_t"].min()
-    return {sid: (ts.date() if pd.notna(ts) else None) for sid, ts in by.items()}
-
-
 def enrol_frames(seg_df: pd.DataFrame, enrol_sessions: int = 3) -> dict:
     """{subject_id: enrol_seg_df} from each subject's EARLIEST sessions, for
-    template building (enrol.py). This does NOT require a verify day — any
-    subject with ≥1 session is included — so enrolment is possible from a single
-    sitting even though cross-day EVALUATION of that subject is not."""
+    template building (enrol.py). Any subject with ≥1 session is included, so
+    enrolment is possible from a single sitting."""
     out = {}
     for subject_id, sub in seg_df.groupby("subject_id"):
         sessions = _session_order(sub)
@@ -64,38 +59,31 @@ def enrol_frames(seg_df: pd.DataFrame, enrol_sessions: int = 3) -> dict:
 
 
 def enrol_verify_split(seg_df: pd.DataFrame, enrol_sessions: int = 3):
-    """Per subject: (enrol_seg_df, [(verify_session_id, verify_seg_df), ...]),
-    with verify trials restricted to sessions on a STRICTLY LATER calendar day
-    than the last enrol session. Subjects without at least one enrol day and one
-    strictly-later verify day are skipped."""
+    """Per subject: (enrol_seg_df, [(verify_session_id, verify_seg_df), ...]).
+    Enrol on the subject's EARLIEST sessions, verify on the rest — split purely
+    by session order, with NO calendar-day requirement. A subject needs ≥2
+    sessions; if the earliest-N enrol set would consume every session (a subject
+    with ≤ enrol_sessions sessions), the last session is held out as the verify
+    trial instead.
+
+    ⚠️ The cross-day requirement was removed by request. Verify sessions may now
+    share a calendar day with enrolment. Same-day sessions share warm-up, seating
+    and input state that the distance model can mistake for identity, so any EER
+    produced from a same-day split is NOT evidence the model recognised the
+    PERSON rather than the SITTING — treat every number here as a plumbing /
+    demonstration metric, never a generalisation claim."""
     out = {}
     for subject_id, sub in seg_df.groupby("subject_id"):
         sessions = _session_order(sub)
         if len(sessions) < 2:
-            continue
-        dates = _session_dates(sub)
-
+            continue  # need at least one enrol session and one verify session
         enrol_ids = sessions[:enrol_sessions]
-        enrol_dates = [dates[s] for s in enrol_ids if dates[s] is not None]
-        last_enrol_date = max(enrol_dates) if enrol_dates else None
-        verify_ids = [
-            s for s in sessions[enrol_sessions:]
-            if dates[s] is not None and last_enrol_date is not None and dates[s] > last_enrol_date
-        ]
-
+        verify_ids = sessions[enrol_sessions:]
         if not verify_ids:
-            # Too few sessions for a clean earliest-N split, OR all the later
-            # sessions fell on an enrol day. Fall back to "enrol on every earlier
-            # day, verify on the last day" — still strictly cross-day.
-            all_dates = sorted({d for d in dates.values() if d is not None})
-            if len(all_dates) < 2:
-                continue  # single calendar day — no cross-day verify possible
-            cutoff = all_dates[-1]
-            enrol_ids = [s for s in sessions if dates[s] is not None and dates[s] < cutoff]
-            verify_ids = [s for s in sessions if dates[s] == cutoff]
-            if not enrol_ids or not verify_ids:
-                continue
-
+            # Enrol consumed every session (subject has ≤ enrol_sessions): hold
+            # out the last session as the verify trial.
+            enrol_ids = sessions[:-1]
+            verify_ids = sessions[-1:]
         enrol_df = sub[sub["session_id"].isin(enrol_ids)]
         verify = [(sid, sub[sub["session_id"] == sid]) for sid in verify_ids]
         out[subject_id] = (enrol_df, verify)
@@ -168,13 +156,13 @@ def _loso_eer(genuine_by: dict, impostor_by: dict) -> dict | None:
 
 def evaluate(seg_df: pd.DataFrame, features: list[str] = BIOMETRIC_FEATURES,
              enrol_sessions: int = 3) -> dict:
-    """Build a template per subject, score genuine + impostor cross-day verify
-    trials, return the EER report. The reported EER is leave-one-subject-out when
+    """Build a template per subject, score genuine + impostor verify trials,
+    return the EER report. The reported EER is leave-one-subject-out when
     there are ≥3 subjects; below that it falls back to the in-sample point with
     eer_method='in_sample' so the optimism is labelled, not hidden."""
     split = enrol_verify_split(seg_df, enrol_sessions)
     if len(split) < 2:
-        return {"skipped": f"only {len(split)} subject(s) with cross-day enrol+verify sessions"}
+        return {"skipped": f"only {len(split)} subject(s) with ≥2 sessions for an enrol+verify split"}
 
     _, genuine_by, impostor_by = _trials_by_owner(split, features)
     all_g = np.array([x for v in genuine_by.values() for x in v], float)

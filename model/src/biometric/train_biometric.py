@@ -46,8 +46,8 @@ def main():
     feats = _load_features(args.in_path)
     report = evaluate_biometric.evaluate(feats, BIOMETRIC_FEATURES, args.enrol_sessions)
     if "skipped" in report:
-        sys.exit(f"Cannot calibrate: {report['skipped']}. Need ≥2 subjects with "
-                 f"enrol+verify sessions across different days.")
+        sys.exit(f"Cannot calibrate: {report['skipped']}. Need ≥2 subjects, each "
+                 f"with ≥2 sessions (earliest enrol, the rest verify).")
 
     report["headline"] = {"eer": report["eer"], "n_subjects": report["n_subjects"]}
     verifier = BiometricVerifier(

@@ -22,22 +22,43 @@ data was wiped and `schema.sql` was rewritten as a single from-scratch DDL file 
 a migration any more — see its header) and applied clean; `sampling_version` was reset to 1 in
 the same pass (`LABELING.md` STATUS).
 
-Alongside the game, an **offline Python pipeline is planned to live in `model/`**: it will
-pull telemetry back out of Supabase and train a human-vs-bot classifier. It is a separate
-program, not a backend — nothing in `src/` imports it, nothing in it reaches the browser,
-and it runs by hand after the fact. The PRD's "no Python backend" means the *game* has no
-server; it does not forbid `model/`. **The code for it does not exist yet**; the design is
-in `model/DESIGN.md`.
+Alongside the game, a **Python pipeline lives in `model/`** and is now **built** (design in
+`model/DESIGN.md`; code in `model/src/` as the packages `common`, `bot_detection`, `biometric`,
+`serving`, `skill_stats` plus `archive_telemetry.py`, with tests in `model/tests/`). It pulls
+telemetry back out of Supabase and produces **two distinct ML products with different postures**:
 
-Still out of scope: no LLM integration, no coaching/archetyping, no leaderboards, no
-sound, and no inference in the browser — the classifier will be trained and applied
-offline, once it exists.
+- **Bot detector** — trained and scored **offline, by hand**, writing to the `predictions` table
+  with the service key. It never touches the browser. This is still the "no inference in the
+  browser, applied offline" model the earlier spec describes.
+- **Biometric verifier** — the one **deployed, app-facing** piece. A FastAPI service
+  (`model/src/serving/`, containerised by `model/serving/Dockerfile`, hosted on **Render** via
+  `render.yaml`) that the game calls after a qualifying run through `src/verify-client.js`, showing
+  a quiet trust badge on the results screen. So `src/main.js` **does** import `verify-client.js`,
+  and the model-serving layer **does** reach the browser — over the network, as a **secondary
+  signal only, never a gate** (`canPlay()` is untouched, and the feature is silently off when
+  `VITE_VERIFY_URL` is unset).
+- **Archive-and-prune job** — offline, built, not yet run (see "Known defects" and `src/TODO.md` §1).
+
+The PRD's "no Python backend" still holds in the sense that matters: the *game* has no server of
+its own, bundles only `three` + `@supabase/supabase-js`, and writes telemetry straight to Supabase.
+The verify service is a separate, optional, secondary-signal service — not the game's backend.
+Inference runs **server-side** (offline for the detector, on Render for the verifier), **never in
+the browser**. Nothing is *trained* yet — no bot detector and no biometric verifier artifact exists
+(gated on data collection), so the service runs healthy but `/verify` honestly returns 503/404 until
+a trained model and an enrolled template exist.
+
+Still out of scope: no LLM integration, no coaching/archetyping, no leaderboards, no sound, and no
+in-browser inference.
 
 The **browser app's** runtime dependencies are **only** `three` and
 `@supabase/supabase-js`. No frameworks — the home screen and overlays are plain HTML/CSS.
 Adding a dependency or a framework *there* is a spec violation, not an improvement.
-(The landing page does load Google Fonts over the network; see "Pages and styling".)
-`model/requirements.txt` is a separate dependency set and is not bound by that rule.
+(The landing page does load Google Fonts over the network; see "Pages and styling".) The browser
+also makes **one cross-origin fetch** to the biometric verify service — a bare `fetch`, no new npm
+dependency, and silently off when `VITE_VERIFY_URL` is unset. Three dependency islands sit outside
+the browser-bundle rule and are not bound by it: `model/requirements.txt` + `model/serving/requirements.txt`
+(the pipeline and its service), and `bot_driver/package.json` (Playwright + pngjs, the synthetic-data
+generator).
 
 ## Implemented so far
 
@@ -61,19 +82,32 @@ Adding a dependency or a framework *there* is a spec violation, not an improveme
 - The in-browser Bot Mode has been **removed entirely** — no `?bot=`, no `bot.js`.
 
 **Database (`schema.sql`) — the v2 shape, plus a label-integrity fix layered on top:**
-- Six tables (`subjects`, `profiles`, `sessions`, `segments`, `session_metrics`,
-  `archive_manifest`) plus the `v_training_segments` view, RLS on every client-facing table,
-  append-only by design.
+- Eight tables (`subjects`, `profiles`, `sessions`, `segments`, `session_metrics`,
+  `archive_manifest`, `predictions`, `biometric_templates`) plus the `v_training_segments` view,
+  RLS on every client-facing table, append-only by design. The last two (model predictions and the
+  per-subject biometric signature store) are service-key-only — RLS on, zero policies — and were
+  added by dated files in `migrations/`, then mirrored into `schema.sql` as plain creates (see
+  "Migrations" below).
 - **`subjects.kind` is default-deny** (`'unknown'` by default, not `'human'`), with a
   provenance constraint and a three-valued label in the training view. This was a real
   bug — every signup used to enter the training set as a verified human. Documented in
   full in **`LABELING.md`**, whose STATUS block is the authority on how far it has rolled
   out.
 
-**Not yet started:**
-- `model/` holds only `DESIGN.md`, `.env.example`, `requirements.txt`, and the gitignored
-  `data/` and `models/` directories. Building bot accounts and recruiting trusted human
-  contributors — the data this pipeline needs — also hasn't started.
+**Model & tooling (`model/`, `bot_driver/`) — code built, no trained artifact yet:**
+- `model/` is a full package set (`model/src/{common,bot_detection,biometric,serving,skill_stats}`
+  + `archive_telemetry.py`), with tests (`model/tests/`), a deployable verify service
+  (`model/src/serving/` + `model/serving/Dockerfile`), and the gitignored `data/`/`models/`.
+- `bot_driver/` drives the real game in a real (headed) Chromium via Playwright to generate
+  labelled synthetic bot telemetry through the app's own outbox — it does not touch `src/` or
+  `model/`. Accounts for it are created by `model/src/bot_detection/provision_bot_subjects.py`.
+
+**Not yet started (gated on data collection):**
+- **No trained artifact exists** — no bot detector, no biometric verifier, no enrolled template.
+  Training needs collected data (bot sessions for the detector; ≥2 humans with ≥2 sessions each for
+  the biometric EER — the cross-day requirement was removed, so a same-day EER is a demo metric
+  only). Provisioning bot accounts at scale and recruiting trusted human contributors
+  also hasn't started. The archive-and-prune job is built but not yet run.
 
 ## Commands
 
@@ -89,8 +123,13 @@ Windows/PowerShell is the primary dev environment; use forward slashes in code.
 There is no test runner and no linter — adding one would mean adding dependencies. See
 "Verifying changes" below for how this codebase is actually exercised.
 
-The offline pipeline will be a second program with its own virtualenv and entry points,
-once it exists. Its planned commands are in `model/DESIGN.md`; none of them run today.
+The Python pipeline is a **second program** with its own virtualenv (`model/.venv`), its own
+dependency set (`model/requirements.txt`, and `model/serving/requirements.txt` for the service),
+entry points under `model/src/`, and tests in `model/tests/`. Its commands are in `model/DESIGN.md`.
+The code runs today (fetch, features, codec, archive `--dry-run` are live-verified); what does not
+run is any *training* that produces a model, because no data has been collected yet. `bot_driver/`
+is a third program again (`cd bot_driver && npm install && npx playwright install chromium`, then
+`npm run bot -- …`).
 
 ## Architecture
 
@@ -274,6 +313,21 @@ JS at all.
 
 ### Hosting, URLs and static files
 
+**There are two deployment surfaces, and they must not be confused.** The game (the static
+`dist/` bundle) is hosted on **Vercel** at `aimprint.vercel.app`; the biometric verify service (the
+FastAPI container) is hosted separately on **Render**. Only the game is a Vercel deploy; `render.yaml`
+and the Dockerfile are nothing to do with the Vercel build. The browser reaches the Render service
+at run-end through `VITE_VERIFY_URL` (set in `.env.local` locally, and in the Vercel project's env
+for production — Vite inlines it at build time, so production must be rebuilt after it changes).
+
+**The Render service is a free-plan web service and spins down after ~15 min idle** (wakes in
+~1 min). `src/main.js` fires a warm-up ping to `/health` when a **run starts**, so by the time the
+post-session `/verify` call fires minutes later the service is already awake — the cold start never
+lands on the player. `render.yaml` builds `model/serving/Dockerfile` with the **repo root** as
+Docker context, and its only secrets (`SUPABASE_SERVICE_KEY`, optional `CORS_ALLOW_ORIGINS`) are set
+in the Render dashboard, never committed — the service_role key it reads templates with must never
+reach the browser bundle. Full deploy runbook is in `README.md` ("Biometric verification").
+
 **`vercel.json` sets `cleanUrls: true` and `trailingSlash: false`,** which is what serves
 `dist/play.html` at `/play` and 301s `/play.html` to it. `trailingSlash` is not optional
 cosmetics: `/play/` would otherwise resolve relative asset paths one directory too deep.
@@ -309,14 +363,26 @@ All of it is current; read it rather than re-deriving:
   (403 / RLS, the `42501` upsert-header trap). It is the origin story for the outbox rules
   in "Supabase" below; read it before changing delivery.
 - **`aim-simulator-prd.md`** — the spec. §3 carries the `(v2)` markers.
-- **`model/DESIGN.md`** — the unbuilt pipeline's design, including the archive job and the
-  bot-detector / biometric-identification training protocols.
+- **`model/DESIGN.md`** — the pipeline's design (now built), including the archive job, the
+  serving layer, and the bot-detector / biometric training protocols.
+- **`src/TODO.md`** — the deferred database/pipeline work that is deliberately undone (archive job
+  not yet run, `client_events` deferred, `segments.id` → UUIDv7 deferred). Read before "fixing"
+  something it already explains.
 - **`AUDIT-2026-10.md`** — the pre-collection hardening audit: every problem found before data
   collection, its fix, and the files changed (plus accepted risks and known-remaining items).
 - **`STORAGE.md`** — the storage model: the `sampling_version` 1 shrink and the Free-tier
   archive-then-prune design with its operating rules.
 - **`queries/campaign.sql`** — read-only operator queries for the campaign (per-subject progress,
   database size against the archive trigger, ingest-health checks).
+
+Not markdown, but part of the same map:
+- **`render.yaml`** — the Render Blueprint for the biometric verify service (see "Hosting").
+- **`migrations/`** — dated `.sql` changes for the **live** database (which has data), applied on
+  top of the run-once `schema.sql`. Each is also mirrored into `schema.sql` as a plain create for a
+  clean rebuild; do **not** turn `schema.sql` back into a migration. Current files add the
+  `predictions` and `biometric_templates` tables.
+- **`bot_driver/`** — the Playwright synthetic-data generator (see "Implemented so far").
+- **`src/verify-client.js`** — the browser's client for the Render `/verify` + `/health` endpoints.
 
 Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
 
@@ -444,7 +510,7 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
 
 ## Supabase
 
-**The client and the (future) pipeline both speak the v2 schema.** The earlier v1 flat
+**The client and the pipeline both speak the v2 schema.** The earlier v1 flat
 `telemetry_logs` path has been migrated and its table dropped outright:
 
 - `src/supabase.js` requires a **real email + password account** (anonymous sign-in was
@@ -524,7 +590,8 @@ Prefer `src/telemetry.js` + `schema.sql` over any prose if they ever disagree.
   capturing the first session beats the conversion a try-before-signup hook buys. The
   underlying guarantee is unchanged and still enforced server-side: **no auth session, no
   write.**
-- The pipeline's fetch stage (**not yet written**) is meant to select from the
+- The pipeline's fetch stage (`model/src/common/fetch_telemetry.py`, built and live-read-verified)
+  selects from the
   **`v_training_segments`** view with the service key. The view emits `subject_id` (one subject
   row is one identity — there is no merge/collapse step) plus `duration_ms`, and runs
   `security_invoker`. **`is_human` is three-valued** — `true`/`false`/`NULL`, where `NULL`
@@ -558,7 +625,7 @@ reinstated**: `REVOKE` has no `IF EXISTS` form, so revoking on a table that no l
 exists fails with `42P01` and, because the whole file runs as one implicit transaction,
 rolls back the entire run.
 
-**The v2 shape (what `schema.sql` defines).** Six tables, split because hardware and
+**The v2 shape (what `schema.sql` defines).** Eight tables, split because hardware and
 settings are session-scoped while outcomes are segment-scoped:
 
 - `subjects` — the pseudonymous person, deliberately *not* `auth.users`. Deleting an
@@ -577,6 +644,20 @@ settings are session-scoped while outcomes are segment-scoped:
   the player.
 - `archive_manifest` — the index of the offline Parquet archive (one row per archived
   session, with the checksum that gated its prune). Service-key only, RLS-on-no-policy.
+- `predictions` — model guesses (`bot_probability`, `predicted_label`, `model_version` in the PK so
+  re-scoring appends rather than overwrites). **Deliberately a separate table from `session_metrics`
+  and from `subjects.kind`:** the player can read their own `session_metrics` row and must never see
+  their bot-score, and `kind` is human-decided ground truth a retrain must never consume. Service-key
+  only, RLS-on-zero-policy.
+- `biometric_templates` — one per subject, the enrolled signature the verify service reads
+  server-side. Service-key only, RLS-on-zero-policy, and that posture is load-bearing: a
+  client-readable template is a replayable one.
+
+**Migrations.** `schema.sql` is a from-scratch, run-once-on-empty file and must **stay** one — do
+not turn it back into a migration. Changes to the **live** database (which has data) are dated files
+in `migrations/`, pasted as one buffer; each change is **also** mirrored into `schema.sql` as a
+plain create so a future clean rebuild includes it. `predictions` and `biometric_templates` are both
+present this way.
 
 Rules the v2 design encodes, worth preserving in any migration:
 
@@ -649,7 +730,8 @@ remaining step, do not improvise them, and keep that STATUS block current by han
 Most of the earlier multi-user audit is now applied (**`AUDIT-2026-10.md`** is the record). What
 remains:
 
-- **Storage is managed by archive-and-prune, and the archive job does not exist yet.** The
+- **Storage is managed by archive-and-prune, and the archive job is built but has never been run
+  live.** The
   encoding shrink (`sampling_version` 1) plus 5-minute sessions put a 5-min session at ~2.6 MB, and
   the finite campaign (~150 sessions ≈ ~400 MB) fits Free **only if** `segments` is archived to
   Parquet and pruned before it passes ~150 MB (`STORAGE.md`). That archive job is now **built**
@@ -664,15 +746,18 @@ remains:
   and the archive job are built and tested (fixtures + a live read-path run against Supabase:
   fetch, features, archive `--dry-run`). What does **not** exist is any *trained artifact* — no bot
   detector and no biometric verifier have been trained, because that is gated on data collection
-  (bot sessions for the detector; ≥2 humans across separate days for the biometric EER). So you may
+  (bot sessions for the detector; ≥2 humans with ≥2 sessions each for the biometric EER, now that
+  the cross-day split requirement has been removed). So you may
   cite `model/src/*.py` as real, runnable code, but do **not** cite a trained model, an accuracy
   number or an EER as if it exists — those come after collection.
 
-**Deliberately not defects** (recorded so they aren't "discovered" again): no predictions
-table exists yet — correct, it should only be built once a model exists, and it must never
-share a column with verified ground truth; there is no labelling helper function or RPC
-endpoint — rejected on purpose, since PostgREST would auto-expose it to the anon key inlined
-in the browser bundle; there is no email-based auto-enrollment for trusted contributors —
+**Deliberately not defects** (recorded so they aren't "discovered" again): the `predictions` and
+`biometric_templates` tables now exist but are **service-key-only with zero RLS policies** — this is
+correct, not a hole: predictions must never share a column with verified ground truth (`subjects.kind`)
+and the player must never read their own bot-score or a replayable template, so these tables are
+deliberately unreadable by the anon/publishable key the browser carries; there is no labelling helper
+function or RPC endpoint — rejected on purpose, since PostgREST would auto-expose it to the anon key
+inlined in the browser bundle; there is no email-based auto-enrollment for trusted contributors —
 labelling is deliberately manual, by design, per `LABELING.md`; the landing page sharing no
 CSS with `style.css` is intentional, not drift (see "Pages and styling").
 

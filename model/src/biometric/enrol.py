@@ -35,9 +35,9 @@ def main():
     if raw.empty:
         sys.exit("No human-labelled segments to enrol.")
     feats = build_segment_features(raw)
-    # Enrolment uses each subject's earliest sessions directly — it does NOT
-    # require a cross-day verify session (that requirement belongs to EVALUATION,
-    # enrol_verify_split), so a template can be built from a single sitting.
+    # Enrolment uses each subject's earliest sessions directly — a template can
+    # be built from a single sitting (≥1 session), independent of how evaluation
+    # splits enrol vs verify.
     frames = evaluate_biometric.enrol_frames(feats, args.enrol_sessions)
     if not frames:
         sys.exit("No subjects with sessions to enrol.")

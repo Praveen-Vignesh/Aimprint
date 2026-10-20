@@ -210,10 +210,15 @@ guards it.
 The depth-oriented task — "is this the same person who played last week" — and why per-subject
 session count matters. Protocol:
 
-- **Enrol on sessions 1–3, verify on sessions 4–5**, per subject. This is why the campaign asks
-  for ≥5 sessions across ≥3 separate days: same-day sessions share warm-up, seating and input
-  state that the model can learn as identity, so verification on a *later day* is what proves it
-  learned the person rather than the sitting.
+- **Enrol on the earliest sessions, verify on the rest**, per subject, split by session order.
+  The campaign target is now **≥3 sessions** per subject (a subject needs ≥2 to produce an
+  enrol+verify split at all). **The cross-day requirement was removed** (`enrol_verify_split`):
+  enrol and verify may fall on the same calendar day. ⚠️ That weakens the result — same-day
+  sessions share warm-up, seating and input state the model can learn *as* identity, so a same-day
+  EER does not prove it learned the *person* rather than the *sitting*. Read it as a
+  plumbing/demonstration metric. (The original protocol required ≥5 sessions across ≥3 separate
+  days and a strictly-later verify day precisely to rule this out; restore that for any result you
+  want to defend.)
 - It is offline evaluation only (train once, report enrol-vs-verify accuracy) — there is no live
   template table and the archive-and-prune model is built on that assumption (`AUDIT-2026-10.md`,
   auth-scope decision). A live check would need a small permanent per-subject signature table,

@@ -1,7 +1,8 @@
 """End-to-end smoke test for the biometric path — no DB. Synthesizes a few
-subjects with distinct motor "styles", each playing several sessions across
-different days, then checks: enrol/verify splits by day, templates build,
-genuine distances sit below impostor distances, and EER computes in [0,1].
+subjects with distinct motor "styles", each playing several sessions, then
+checks: enrol/verify splits by session order (NO calendar-day requirement —
+that was removed), templates build, genuine distances sit below impostor
+distances, and EER computes in [0,1].
 
 Run from model/:
     python -m tests.test_biometric_smoke
@@ -70,13 +71,31 @@ def _frame():
     return build_segment_features(pd.DataFrame(rows))
 
 
-def test_split_by_day():
+def test_split_by_session_order():
     feats = _frame()
     split = evaluate_biometric.enrol_verify_split(feats, enrol_sessions=3)
     assert set(split) == set(STYLES)
     for _, (enrol_df, verify) in split.items():
-        assert enrol_df["session_id"].nunique() == 3
-        assert len(verify) == 2  # sessions 4 and 5
+        assert enrol_df["session_id"].nunique() == 3  # earliest 3 sessions
+        assert len(verify) == 2  # the remaining 2 sessions
+
+
+def test_same_day_sessions_now_split():
+    """Cross-day removed: a subject whose sessions are ALL on one calendar day
+    must now produce an enrol+verify split (previously it was skipped)."""
+    rng = np.random.default_rng(11)
+    rows = []
+    for session_idx in range(3):  # three sessions, same date (DATES[0])
+        for seg_idx in range(8):
+            r = _segment("dave", session_idx, seg_idx, STYLES["alice"], rng)
+            r["session_started_at"] = f"{DATES[0]}T{12 + session_idx}:00:00+00:00"
+            rows.append(r)
+    feats = build_segment_features(pd.DataFrame(rows))
+    split = evaluate_biometric.enrol_verify_split(feats, enrol_sessions=2)
+    assert "dave" in split, "same-day subject should split now that cross-day is removed"
+    enrol_df, verify = split["dave"]
+    assert enrol_df["session_id"].nunique() == 2
+    assert len(verify) == 1
 
 
 def test_template_and_distance_separates():
