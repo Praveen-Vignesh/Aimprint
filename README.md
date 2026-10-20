@@ -119,7 +119,7 @@ crosshair was over a target that frame. For static-target routines (flick,
 spidershot) the `tx/ty/tz` columns are omitted — the target does not move, so its
 position comes from the per-segment `targets` snapshot instead. The raw
 `input_events` stream is stored delta-encoded (`{t0, dt, dx, dy}`, timestamps in
-tenths of a millisecond). Both are `sampling_version` 4.
+tenths of a millisecond). Both are `sampling_version` 1.
 
 Delivery goes through a durable outbox (`src/outbox.js`): batched, retried with
 backoff, mirrored to IndexedDB, replayed on the next page load, and scoped to the

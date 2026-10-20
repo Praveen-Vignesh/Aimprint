@@ -652,17 +652,21 @@ remains:
 - **Storage is managed by archive-and-prune, and the archive job does not exist yet.** The
   encoding shrink (`sampling_version` 1) plus 5-minute sessions put a 5-min session at ~2.6 MB, and
   the finite campaign (~150 sessions ≈ ~400 MB) fits Free **only if** `segments` is archived to
-  Parquet and pruned before it passes ~150 MB (`STORAGE.md`). That archive job is the first
-  unbuilt piece of `model/` (`src/TODO.md` §1). Watch `segments` size with
+  Parquet and pruned before it passes ~150 MB (`STORAGE.md`). That archive job is now **built**
+  (`model/src/archive_telemetry.py`, tested + live-read-verified) but **not yet run** — the
+  destructive prune is only needed around session 60 (`src/TODO.md` §1). Watch `segments` size with
   `queries/campaign.sql` §3 from week one.
 - **Ingest loss is still only visible client-side** (`console.warn`). `queries/campaign.sql` §4
   answers "is data landing" from the database; a `client_events` table is deferred (`src/TODO.md`
   §2). *(The old "failed `sessions` insert discards the run" defect is fixed — see D.1 /
   `AUDIT-2026-10.md` #4.)*
-- **`model/` does not exist as code.** A reminder that the pipeline (and now the archive job) is a
-  design (`model/DESIGN.md`, `STORAGE.md`), not a working program; do not cite a `model/src/*.py`
-  file as if it runs. `schema.sql`'s comment above `v_training_segments` names `fetch_telemetry.py`
-  as its consumer; that is a forward reference.
+- **`model/` now exists as code, but no model is trained yet.** The pipeline, the serving layer
+  and the archive job are built and tested (fixtures + a live read-path run against Supabase:
+  fetch, features, archive `--dry-run`). What does **not** exist is any *trained artifact* — no bot
+  detector and no biometric verifier have been trained, because that is gated on data collection
+  (bot sessions for the detector; ≥2 humans across separate days for the biometric EER). So you may
+  cite `model/src/*.py` as real, runnable code, but do **not** cite a trained model, an accuracy
+  number or an EER as if it exists — those come after collection.
 
 **Deliberately not defects** (recorded so they aren't "discovered" again): no predictions
 table exists yet — correct, it should only be built once a model exists, and it must never

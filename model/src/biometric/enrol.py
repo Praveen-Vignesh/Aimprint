@@ -35,13 +35,16 @@ def main():
     if raw.empty:
         sys.exit("No human-labelled segments to enrol.")
     feats = build_segment_features(raw)
-    split = evaluate_biometric.enrol_verify_split(feats, args.enrol_sessions)
-    if not split:
-        sys.exit("No subjects with enough sessions to enrol.")
+    # Enrolment uses each subject's earliest sessions directly — it does NOT
+    # require a cross-day verify session (that requirement belongs to EVALUATION,
+    # enrol_verify_split), so a template can be built from a single sitting.
+    frames = evaluate_biometric.enrol_frames(feats, args.enrol_sessions)
+    if not frames:
+        sys.exit("No subjects with sessions to enrol.")
 
     version = datetime.now(timezone.utc).strftime("%Y%m%d")
     rows = []
-    for subject_id, (enrol_df, _) in split.items():
+    for subject_id, enrol_df in frames.items():
         tmpl = build_template(enrol_df, BIOMETRIC_FEATURES)
         rows.append({
             "subject_id": subject_id,

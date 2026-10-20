@@ -17,23 +17,30 @@ These were open items here and are now in the tree (see `AUDIT-2026-10.md` for t
   session id and both session and segment rows go through durable outboxes; `23503` is now
   transient. `src/supabase.js`, `src/game.js`, `src/outbox.js`.
 - **Effective batch size fixed** (was in 4d) — `FLUSH_DEBOUNCE_MS` 400 → 5000 in `src/outbox.js`.
-- **Storage growth** (was 4a) — addressed by the `sampling_version = 4` shrink plus the
+- **Storage growth** (was 4a) — addressed by the `sampling_version = 1` shrink plus the
   archive-then-prune model. See **`STORAGE.md`**. The one piece still to build is the archive
   job itself (below).
 
 ---
 
-## 1. The offline archive job — NOT YET WRITTEN
+## 1. The offline archive job — BUILT, NOT YET RUN LIVE
 
-**Status:** needed by about session 60, when `segments` approaches the ~150 MB high-water mark
-(`STORAGE.md` §4). Watch it with `queries/campaign.sql` §3 from the first week.
+**Status (2026-10-20):** built at `model/src/archive_telemetry.py`, unit-tested
+(`model/tests/test_archive.py` — the verify-before-delete gate, decode, content hash), and its
+**read path proven live** via `--dry-run` against Supabase. The destructive path (Storage upload,
+manifest insert, `DELETE`) is deliberately **un-run** — it is needed only around session 60, when
+`segments` approaches the ~150 MB high-water mark (`STORAGE.md` §4). Watch it with
+`queries/campaign.sql` §3 from the first week; run it (drop `--dry-run`) when the size nears the
+ceiling.
 
-It is the first real code in `model/`. Its contract is specified in `model/DESIGN.md`
-(§ "The offline archive job") and `STORAGE.md` §3: select aged sessions, write decoded Parquet
-to the local drive **and** Supabase Storage, **verify row-count + sha256 before deleting**,
-record `archive_manifest`, then `DELETE` the staging segments; re-runnable, with late-arrival
-detection (`queries/campaign.sql` §4d). The delta/`tx-ty-tz` decode (`sampling_version = 4`)
-lives here and nowhere else, guarded by a JS→Python round-trip test.
+Its contract (`model/DESIGN.md` § "The offline archive job", `STORAGE.md` §3): select aged
+sessions, write decoded Parquet to the local drive **and** Supabase Storage, **verify row-count +
+sha256 before deleting**, record `archive_manifest`, then `DELETE` the staging segments;
+re-runnable, with late-arrival detection (`queries/campaign.sql` §4d). The delta/`tx-ty-tz` decode
+(`sampling_version = 1`) lives in the shared codec (`model/src/common/codec.py`), guarded by the
+JS→Python round-trip test. **One follow-up still open:** the fetch stage must union archived
+Parquet with the un-archived live tail (`model/DESIGN.md`); it currently reads only the live view,
+which is correct until the first real archive run prunes anything.
 
 ---
 
