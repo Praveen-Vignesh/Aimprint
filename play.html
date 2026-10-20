@@ -30,9 +30,86 @@
   <meta name="twitter:description"
     content="Pick a routine, set your sensitivity, and run a timed aim session in your browser." />
   <meta name="twitter:image" content="https://aimprint.vercel.app/og-image.png" />
+
+  <!-- Boot-fallback styles only. Scoped to #boot-fallback so they never touch
+       the game UI, and inline so the fallback is legible even when style.css or
+       the app JS never loads. Positioning uses longhand (not `inset`) for old
+       Safari. -->
+  <style>
+    #boot-fallback {
+      display: none;
+      position: fixed;
+      top: 0; right: 0; bottom: 0; left: 0;
+      z-index: 9999;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: #1a1a1a;
+      color: #dcdcdc;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    #boot-fallback .boot-fallback-card { max-width: 30rem; text-align: center; line-height: 1.6; }
+    #boot-fallback h1 { font-size: 1.4rem; margin: 0 0 0.75rem; color: #fff; }
+    #boot-fallback p { margin: 0 0 0.75rem; }
+    #boot-fallback a { color: #ff8080; }
+  </style>
 </head>
 
 <body>
+  <!-- Boot fallback: shown when the 3D trainer cannot start on this device — no
+       WebGL, a browser too old for ES modules, or any uncaught error during boot.
+       Before this, such a failure left a silently half-rendered, dead page (the
+       UI wiring in main.js runs AFTER createScene(), which throws on no WebGL).
+       ES5-only and self-contained so the guard cannot itself fail on an old
+       browser. It touches nothing in the game, the telemetry, or the schema. -->
+  <div id="boot-fallback">
+    <div class="boot-fallback-card">
+      <h1>This device can't run the trainer</h1>
+      <p id="boot-fallback-detail">Something stopped the 3D aim trainer from starting in this browser.</p>
+      <p>Try updating your browser, enabling hardware acceleration, or opening it on another device. The rest of the site works fine.</p>
+      <a href="/">&larr; Back to Aimprint home</a>
+    </div>
+  </div>
+  <script>
+    (function () {
+      var shown = false;
+      function show(detail) {
+        if (shown) { return; }
+        shown = true;
+        var el = document.getElementById('boot-fallback');
+        if (!el) { return; }
+        if (detail) {
+          var d = document.getElementById('boot-fallback-detail');
+          if (d) { d.textContent = detail; }
+        }
+        el.style.display = 'flex';
+      }
+      window.__showBootFallback = show;
+      // Catch-all: an uncaught error during module load — a parse failure on an
+      // old browser, or a runtime throw such as WebGL failing to initialise in
+      // createScene() — surfaces to the global error handler.
+      window.addEventListener('error', function () { show(); });
+      // Proactive, specific check for the most common cause on old machines: the
+      // 3D trainer needs WebGL, and a Mac with no/blocked WebGL cannot run it.
+      try {
+        var canvas = document.createElement('canvas');
+        var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+        if (!gl) {
+          show('Your browser or graphics hardware does not support WebGL, which the 3D aim trainer needs.');
+        }
+      } catch (e) {
+        show('Your browser or graphics hardware does not support WebGL, which the 3D aim trainer needs.');
+      }
+    })();
+  </script>
+  <!-- Browsers too old to support ES modules ignore the module script entirely,
+       so no error fires — target them explicitly. -->
+  <script nomodule>
+    if (window.__showBootFallback) {
+      window.__showBootFallback('This browser is too old to run the trainer (no ES module support). Please update it.');
+    }
+  </script>
+
   <canvas id="scene"></canvas>
   <div id="crosshair"></div>
   <div id="hud">
