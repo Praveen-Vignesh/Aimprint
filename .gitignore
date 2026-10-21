@@ -27,3 +27,7 @@ model/**/__pycache__/
 .ua/
 model/models/**
 !model/models/**/.gitkeep
+
+
+*.md
+migrations/
