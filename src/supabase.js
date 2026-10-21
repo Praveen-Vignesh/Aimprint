@@ -247,7 +247,7 @@ export async function signUp({ email, password, fullName }) {
     password,
     options: trimmedName === '' ? undefined : { data: { full_name: trimmedName } }
   });
-  if (error) return { error: error.message };
+  if (error) return { error: friendlyAuthMessage(error.message) };
 
   // With "Confirm email" ON, Supabase does NOT reject a signup for an address
   // that already has an account — it returns a decoy success, so the endpoint
@@ -267,10 +267,46 @@ export async function signUp({ email, password, fullName }) {
   return { needsConfirmation: data.session === null };
 }
 
+// Rewrites the handful of raw Supabase auth strings a player can actually hit
+// into plain language. Anything unmapped passes through unchanged — better an
+// honest raw message than a wrong friendly one. The resend THROTTLE message
+// ("For security purposes… after N seconds") is passed through on purpose: it
+// names the exact wait, which is more useful than a generic line.
+function friendlyAuthMessage(raw) {
+  const m = (raw ?? '').toLowerCase();
+  if (m.includes('email not confirmed')) {
+    return 'Your email address is not confirmed yet. Check your inbox for the confirmation link — or resend it below.';
+  }
+  if (m.includes('for security purposes') && m.includes('after')) return raw;
+  if (m.includes('rate limit') || m.includes('too many') || m.includes('exceeded')) {
+    return 'Too many email requests in a short time. Please wait a few minutes, then try again.';
+  }
+  if (m.includes('invalid login credentials')) return 'That email or password is incorrect.';
+  return raw;
+}
+
 export async function signIn({ email, password }) {
   if (client === null) return { error: 'Supabase is not configured.' };
   const { error } = await client.auth.signInWithPassword({ email, password });
-  if (error) return { error: error.message };
+  if (error) {
+    // "Email not confirmed" is not a dead end: flag it so the panel can offer a
+    // fresh confirmation link instead of leaving the player stuck. Every other
+    // failure is a plain error.
+    const needsConfirmation = /email not confirmed/i.test(error.message);
+    return { error: friendlyAuthMessage(error.message), needsConfirmation };
+  }
+  return {};
+}
+
+// Re-sends the sign-up confirmation email for an address that registered but
+// never confirmed (lost mail, an hourly rate limit, or an expired link).
+// Supabase's resend is a silent no-op for an already-confirmed or unknown
+// address and does not reveal which, so a success here never proves an account
+// exists — the panel's copy stays deliberately vague to preserve that.
+export async function resendConfirmation(email) {
+  if (client === null) return { error: 'Supabase is not configured.' };
+  const { error } = await client.auth.resend({ type: 'signup', email });
+  if (error) return { error: friendlyAuthMessage(error.message) };
   return {};
 }
 

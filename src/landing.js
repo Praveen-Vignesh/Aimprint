@@ -11,7 +11,8 @@ import {
   validateSession,
   setRememberMe,
   requestPasswordReset,
-  updatePassword
+  updatePassword,
+  resendConfirmation
 } from './supabase.js';
 import { createAuthPanel } from './ui/auth-panel.js';
 
@@ -46,6 +47,9 @@ if (root !== null) {
       },
       onUpdatePassword(password) {
         return updatePassword(password);
+      },
+      onResendConfirmation(email) {
+        return resendConfirmation(email);
       }
     },
     // Fires only on the TRANSITION into signed in, so finishing the form

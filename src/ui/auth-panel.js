@@ -63,6 +63,7 @@ const REQUIRED = [
   'signup',
   'google',
   'message',
+  'resend',
   'account-email',
   'signout',
   'reset-email',
@@ -131,6 +132,15 @@ export function createAuthPanel({ root, auth, onReady = null }) {
     el.message.classList.toggle('error', isError === true && Boolean(text));
   }
 
+  // The "Resend confirmation email" button is hidden until a path that actually
+  // needs it is reached — a fresh sign-up (needsConfirmation) or a sign-in that
+  // failed because the address was never confirmed. It is deliberately NOT a
+  // permanent control: showing it unconditionally would invite confirmed users
+  // to spend the hourly email budget for no reason.
+  function showResend(visible) {
+    show(el.resend, visible);
+  }
+
   function setFieldError(node, text) {
     node.textContent = text ?? '';
   }
@@ -149,7 +159,8 @@ export function createAuthPanel({ root, auth, onReady = null }) {
       'reset-request-submit',
       'new-password',
       'confirm-new-password',
-      'reset-submit'
+      'reset-submit',
+      'resend'
     ]) {
       el[key].disabled = busy;
     }
@@ -197,6 +208,7 @@ export function createAuthPanel({ root, auth, onReady = null }) {
 
   function setMode(next) {
     mode = next;
+    showResend(false);
     renderMode();
   }
 
@@ -208,6 +220,7 @@ export function createAuthPanel({ root, auth, onReady = null }) {
     show(el['view-reset-request'], next === 'reset-request');
     show(el['view-reset-new'], next === 'reset-new');
     setMessage('');
+    showResend(false);
   }
 
   // --- password visibility toggles ---------------------------------------
@@ -280,13 +293,17 @@ export function createAuthPanel({ root, auth, onReady = null }) {
     auth.onRememberMe(el.remember.checked);
     setBusy(true);
     setMessage('');
+    showResend(false);
     const result = await withBusyLabel(el.signin, 'Signing in…', () =>
       auth.onSignIn(credentials())
     );
     setBusy(false);
 
-    if (result && result.error) setMessage(result.error, true);
-    else setMessage('');
+    if (result && result.error) {
+      setMessage(result.error, true);
+      // An unconfirmed address is recoverable, not a dead end — offer the resend.
+      if (result.needsConfirmation === true) showResend(true);
+    } else setMessage('');
   }
 
   async function handleSignUp() {
@@ -298,6 +315,7 @@ export function createAuthPanel({ root, auth, onReady = null }) {
     auth.onRememberMe(el.remember.checked);
     setBusy(true);
     setMessage('');
+    showResend(false);
     const { email, password } = credentials();
     const fullName = el.fullname.value;
     const result = await withBusyLabel(el.signup, 'Creating account…', () =>
@@ -308,7 +326,33 @@ export function createAuthPanel({ root, auth, onReady = null }) {
     if (result && result.error) setMessage(result.error, true);
     else if (result && result.needsConfirmation) {
       setMessage('Account created. Check your email to confirm, then sign in.');
+      // If the confirmation mail never arrives (lost, or the hourly cap was hit)
+      // the player can send a fresh link from here.
+      showResend(true);
     } else setMessage('');
+  }
+
+  // Resends the confirmation link to whatever address is in the email field.
+  // Reachable only once showResend(true) has run, so there is always a relevant
+  // address; still guards an empty/invalid field rather than firing a blind
+  // request. The wording never confirms the account exists — the resend is a
+  // silent no-op for a confirmed/unknown address by design.
+  async function handleResend() {
+    const email = el.email.value.trim();
+    if (email === '' || EMAIL_RE.test(email) === false) {
+      setFieldError(el['email-error'], 'Enter the email you signed up with.');
+      return;
+    }
+    if (typeof auth.onResendConfirmation !== 'function') return;
+
+    setBusy(true);
+    const result = await withBusyLabel(el.resend, 'Sending…', () =>
+      auth.onResendConfirmation(email)
+    );
+    setBusy(false);
+
+    if (result && result.error) setMessage(result.error, true);
+    else setMessage('If that address still needs confirming, a new link is on its way — check your inbox and spam.');
   }
 
   async function handleGoogleSignIn() {
@@ -368,6 +412,7 @@ export function createAuthPanel({ root, auth, onReady = null }) {
 
   el.signin.addEventListener('click', handleSignIn);
   el.signup.addEventListener('click', handleSignUp);
+  el.resend.addEventListener('click', handleResend);
   el.google.addEventListener('click', handleGoogleSignIn);
   el.signout.addEventListener('click', () => auth.onSignOut());
 
