@@ -107,13 +107,111 @@ export function jitter(err, state, rng) {
   };
 }
 
-// variant name → { aim, reactionMs }. reactionMs is the delay after the game
-// reports onTarget before the harness fires, so each variant has its own
-// click-timing fingerprint too.
+// The HARD one: a deliberate humanlike motor model built to defeat the detector
+// across every feature the easy variants fail on at once. It is NOT a tuned
+// aimbot — it reproduces the imperfections a real hand has, so a detector that
+// still flags it is flagging genuine human-like motion. Three mechanisms:
+//
+//   1. Two-phase submovement aiming. A fast BALLISTIC primary move with a
+//      minimum-jerk (bell-shaped) velocity profile that deliberately UNDERSHOOTS
+//      (lands at ~80–92% of the distance, randomised per flick), then one or
+//      more slower CORRECTIVE submovements to close the residual. This is the
+//      Meyer optimised-submovement picture of human aiming — it fixes
+//      submovement_count, time_to_peak_fraction, velocity_skew, sparc,
+//      on_entry_abruptness and (via the correction + tremor) reversal_rate,
+//      where linear/smooth all read as a single inhuman stroke.
+//   2. Physiological tremor: a small CORRELATED 8–12 Hz oscillation applied
+//      laterally, not the uncorrelated white noise `jitter` uses. This is what
+//      puts power in the real tremor band (tremor_band_power) and gives the
+//      count stream human lag-1 autocorrelation (count_lag1_autocorr, jerk_std)
+//      instead of jitter's tell-tale ~0 autocorrelation.
+//   3. Mild randomised curvature on the ballistic phase (random side, decaying
+//      as it closes), so the path is neither dead straight nor a fixed arc
+//      (straightness).
+//
+// Convergence: the ballistic phase commands at most `undershoot·D`; once it ends
+// the correction phase always steps a fraction (<1) of the CURRENT error, so the
+// aim provably closes for any geometry — the harness convergence guard is never
+// tripped by design. Reaction-time variance and click scatter (time_to_click_ms,
+// dwell_ms, radial_offset, offset_bias) are added by run.js, not here, because
+// they are properties of WHEN the harness fires, not of the per-frame turn.
+const HL_TREMOR_W1 = (2 * Math.PI * 9) / 60;   // ~9 Hz at 60 fps
+const HL_TREMOR_W2 = (2 * Math.PI * 11.5) / 60; // ~11.5 Hz
+export function humanlike(err, state, rng) {
+  const u = () => (typeof rng === 'function' ? rng() : Math.random());
+  const m = mag(err);
+
+  // Plan the movement once, when the target is acquired (state is reset by the
+  // harness per target). Every parameter is randomised so no two flicks are
+  // identical — the trial-to-trial variability a real hand has and the easy
+  // variants lack.
+  if (state.hl === undefined) {
+    state.hl = {
+      t: 0,
+      D: Math.max(m, 1e-6),
+      prog: 0, // cumulative min-jerk fraction already commanded
+      undershoot: 0.8 + 0.12 * u(), // ballistic lands at 80–92%
+      T: 5 + Math.round(4 * u()), // ballistic duration, 5–9 frames
+      curve: 0.12 + 0.18 * u(), // peak arc rotation (radians), early-flight only
+      side: state.side ?? (u() < 0.5 ? -1 : 1), // harness sets state.side per target
+      corrGain: 0.26 + 0.12 * u(), // correction submovement gain (<1 → converges)
+      ph1: 2 * Math.PI * u(),
+      ph2: 2 * Math.PI * u(),
+      tremorAmp: 0.0010 + 0.0010 * u() // 1–2 mrad lateral tremor
+    };
+  }
+  const s = state.hl;
+  s.t += 1;
+  const d = dir(err);
+  let stepYaw;
+  let stepPitch;
+
+  if (s.t <= s.T) {
+    // Ballistic: advance along the min-jerk position profile f(τ)=10τ³−15τ⁴+6τ⁵
+    // (velocity peaks mid-flight), scaled to undershoot·D, with early curvature.
+    const tau = Math.min(1, s.t / s.T);
+    const f = 10 * tau ** 3 - 15 * tau ** 4 + 6 * tau ** 5;
+    const target = s.undershoot * f;
+    const stepMag = Math.max(0, target - s.prog) * s.D;
+    s.prog = target;
+    const theta = s.curve * (1 - tau) * s.side;
+    const c = Math.cos(theta);
+    const si = Math.sin(theta);
+    stepYaw = (d.yaw * c - d.pitch * si) * stepMag;
+    stepPitch = (d.yaw * si + d.pitch * c) * stepMag;
+  } else {
+    // Correction: close the residual with a slower submovement aimed at the
+    // CURRENT error. Gain < 1, so it decelerates onto the target over a few
+    // frames — a visible second (and sometimes third) velocity bump.
+    const g = s.corrGain * (0.9 + 0.2 * u());
+    stepYaw = err.yaw * g;
+    stepPitch = err.pitch * g;
+  }
+
+  // Correlated lateral tremor (perpendicular to the aim direction), present in
+  // both phases. Tiny relative to the target's angular radius, so it textures
+  // the trajectory without preventing onTarget.
+  const tr = s.tremorAmp * (Math.sin(HL_TREMOR_W1 * s.t + s.ph1) + 0.6 * Math.sin(HL_TREMOR_W2 * s.t + s.ph2));
+  stepYaw += -d.pitch * tr;
+  stepPitch += d.yaw * tr;
+
+  const cap = 3 * MAX_STEP;
+  return {
+    dYaw: Math.max(-cap, Math.min(cap, stepYaw)),
+    dPitch: Math.max(-cap, Math.min(cap, stepPitch))
+  };
+}
+
+// variant name → { aim, reactionMs, reactionSdMs? }. reactionMs is the delay
+// after the game reports onTarget before the harness fires, so each variant has
+// its own click-timing fingerprint. The easy variants use a FIXED delay (zero
+// variance — itself a tell); `humanlike` carries reactionSdMs so run.js samples
+// a right-skewed (log-normal) reaction per flick, the way a hand does.
 export const CONTROLLERS = {
   linear:    { aim: linear,    reactionMs: 20 },
   smooth:    { aim: smooth,    reactionMs: 60 },
   bezier:    { aim: bezier,    reactionMs: 45 },
   overshoot: { aim: overshoot, reactionMs: 35 },
-  jitter:    { aim: jitter,    reactionMs: 50 }
+  jitter:    { aim: jitter,    reactionMs: 50 },
+  humanlike: { aim: humanlike, reactionMs: 210, reactionSdMs: 70 }
 };

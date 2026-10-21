@@ -268,19 +268,23 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
       }
     },
 
-    // Drives the post-session trust badge. Called first with 'checking' and
-    // then with the resolved verify-client state. OFF/UNAVAILABLE (and any
-    // unknown state) hide the badge, keeping an unreachable or unconfigured
-    // endpoint silent.
-    setVerifyState(state) {
+    // Drives the post-session trust badge. Accepts either a bare state string
+    // (the initial 'checking') or the verify-client's { state, matchPercent }
+    // object, so a resolved match/mismatch can show the percentage. OFF/
+    // UNAVAILABLE (and any unknown state) hide the badge, keeping an unreachable
+    // or unconfigured endpoint silent.
+    setVerifyState(input) {
       if (!resultVerify) return;
+      const state = typeof input === 'string' ? input : input?.state;
+      const matchPercent = typeof input === 'object' ? input?.matchPercent : null;
       const copy = VERIFY_COPY[state];
       resultVerify.classList.remove('match', 'mismatch');
       if (!copy) {
         resultVerify.classList.add('hidden');
         return;
       }
-      resultVerifyLabel.textContent = copy.text;
+      const pct = typeof matchPercent === 'number' ? ` (${matchPercent}% match)` : '';
+      resultVerifyLabel.textContent = copy.text + pct;
       if (copy.cls) resultVerify.classList.add(copy.cls);
       resultVerify.classList.remove('hidden');
     },

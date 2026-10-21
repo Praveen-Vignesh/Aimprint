@@ -54,18 +54,35 @@ export function warmVerifyService({
     .catch(() => {});
 }
 
-// Verifies one finished session. Returns a VERIFY_STATES value; never throws and
-// never blocks the caller's own flow (callers fire it without awaiting and fill
-// the badge when it resolves). `url`/`fetchImpl` are injectable for tests.
+// Turns the verifier's raw distance into a 0–100 "match %" anchored on the
+// model's OWN operating threshold: distance 0 → 100%, distance == threshold →
+// 50% (the accept/reject line), distance ≥ 2×threshold → 0%. So accepts read
+// above 50% and rejects below it, and the number is the real model output, not
+// a fabricated one. It is a DEMO figure at the current data scale (EER ≈ 0.5):
+// honest as "the model's similarity score", not as a validated confidence.
+function matchPercentFromDistance(distance, threshold) {
+  if (typeof distance !== 'number' || typeof threshold !== 'number' || threshold <= 0) {
+    return null;
+  }
+  const pct = 100 * (1 - distance / (2 * threshold));
+  return Math.max(0, Math.min(100, Math.round(pct)));
+}
+
+// Verifies one finished session. Returns { state, matchPercent } — matchPercent
+// is null unless the call resolved to a real accept/reject verdict. Never throws
+// and never blocks the caller (callers fire it without awaiting and fill the
+// badge when it resolves). `url`/`fetchImpl` are injectable for tests.
 export async function verifySession({
   subjectId,
   segments,
   url = defaultVerifyUrl(),
   fetchImpl = typeof fetch === 'function' ? fetch : null
 }) {
+  const result = (state, matchPercent = null) => ({ state, matchPercent });
+
   // Nothing to do, or no way to do it: stay silent (no badge).
   if (!url || !fetchImpl || !subjectId || !Array.isArray(segments) || segments.length === 0) {
-    return VERIFY_STATES.OFF;
+    return result(VERIFY_STATES.OFF);
   }
 
   const endpoint = `${url.replace(/\/$/, '')}/verify`;
@@ -78,20 +95,21 @@ export async function verifySession({
     });
   } catch {
     // Network failure, CORS block, server down — all non-fatal here.
-    return VERIFY_STATES.UNAVAILABLE;
+    return result(VERIFY_STATES.UNAVAILABLE);
   }
 
-  if (response.status === 404) return VERIFY_STATES.NOT_ENOUGH_HISTORY;
-  if (response.status === 503) return VERIFY_STATES.MODEL_NOT_READY;
-  if (!response.ok) return VERIFY_STATES.UNAVAILABLE;
+  if (response.status === 404) return result(VERIFY_STATES.NOT_ENOUGH_HISTORY);
+  if (response.status === 503) return result(VERIFY_STATES.MODEL_NOT_READY);
+  if (!response.ok) return result(VERIFY_STATES.UNAVAILABLE);
 
   let body;
   try {
     body = await response.json();
   } catch {
-    return VERIFY_STATES.UNAVAILABLE;
+    return result(VERIFY_STATES.UNAVAILABLE);
   }
   // The endpoint returns { accept, distance, threshold, model_version, note }.
-  if (typeof body?.accept !== 'boolean') return VERIFY_STATES.UNAVAILABLE;
-  return body.accept ? VERIFY_STATES.MATCH : VERIFY_STATES.MISMATCH;
+  if (typeof body?.accept !== 'boolean') return result(VERIFY_STATES.UNAVAILABLE);
+  const matchPercent = matchPercentFromDistance(body.distance, body.threshold);
+  return result(body.accept ? VERIFY_STATES.MATCH : VERIFY_STATES.MISMATCH, matchPercent);
 }

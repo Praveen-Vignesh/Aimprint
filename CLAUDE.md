@@ -43,9 +43,13 @@ The PRD's "no Python backend" still holds in the sense that matters: the *game* 
 its own, bundles only `three` + `@supabase/supabase-js`, and writes telemetry straight to Supabase.
 The verify service is a separate, optional, secondary-signal service — not the game's backend.
 Inference runs **server-side** (offline for the detector, on Render for the verifier), **never in
-the browser**. Nothing is *trained* yet — no bot detector and no biometric verifier artifact exists
-(gated on data collection), so the service runs healthy but `/verify` honestly returns 503/404 until
-a trained model and an enrolled template exist.
+the browser**. **Both models are now trained (2026-10-21, proof-of-concept scale) and deployed to
+Render via Supabase Storage** — the bot detector (`20261021-logistic-593db355`, behavioural features
+only) and the biometric verifier (`20261021-biometric_distance-a4fea2d4`, 10 enrolled templates).
+Both the `/bot-score` (demo-facing bot/human readout) and `/verify` endpoints resolve against a live
+artifact. The scores are **not production claims**: the bot detector sits at 1.0 because the current
+synthetic bots are trivially separable (too easy, not a good detector), and the biometric EER is
+~0.5 (chance) at only a few calibration subjects. See "Model status" below and `status.html`.
 
 Still out of scope: no LLM integration, no coaching/archetyping, no leaderboards, no sound, and no
 in-browser inference.
@@ -94,7 +98,7 @@ generator).
   full in **`LABELING.md`**, whose STATUS block is the authority on how far it has rolled
   out.
 
-**Model & tooling (`model/`, `bot_driver/`) — code built, no trained artifact yet:**
+**Model & tooling (`model/`, `bot_driver/`) — code built AND both models trained + deployed:**
 - `model/` is a full package set (`model/src/{common,bot_detection,biometric,serving,skill_stats}`
   + `archive_telemetry.py`), with tests (`model/tests/`), a deployable verify service
   (`model/src/serving/` + `model/serving/Dockerfile`), and the gitignored `data/`/`models/`.
@@ -102,12 +106,29 @@ generator).
   labelled synthetic bot telemetry through the app's own outbox — it does not touch `src/` or
   `model/`. Accounts for it are created by `model/src/bot_detection/provision_bot_subjects.py`.
 
-**Not yet started (gated on data collection):**
-- **No trained artifact exists** — no bot detector, no biometric verifier, no enrolled template.
-  Training needs collected data (bot sessions for the detector; ≥2 humans with ≥2 sessions each for
-  the biometric EER — the cross-day requirement was removed, so a same-day EER is a demo metric
-  only). Provisioning bot accounts at scale and recruiting trusted human contributors
-  also hasn't started. The archive-and-prune job is built but not yet run.
+**Trained + deployed (2026-10-21, proof-of-concept scale):**
+- **Both artifacts exist, are uploaded to the `model-artifacts` Supabase Storage bucket, and the
+  Render service serves them.** Bot detector `20261021-logistic-593db355` (**behavioural features
+  only — the hardware block is deliberately excluded; see below**); biometric verifier
+  `20261021-biometric_distance-a4fea2d4` with 10 enrolled templates. Retrain is one command each
+  (`python -m src.bot_detection.pipeline --routine flick`;
+  `python -m src.biometric.pipeline --enrol-sessions 3`), then upload
+  (`python -m src.common.artifact_store --upload --model-type …`) and **restart the Render service**
+  (it loads artifacts only at boot).
+- Current data: ~9 flick-human subjects + 15 synthetic bot subjects (5 variants × 3) for the
+  detector; ~10 enrolled humans, EER calibrated on the ~3 with ≥2 sessions. **The numbers are not
+  production claims** — the bot detector is 1.0 because the synthetic bots are still trivially
+  separable (too easy), and the biometric EER is ~0.5 (chance) at this subject count.
+- **Models are trained on behavioural features only (velocity/trajectory/timing), never the session
+  hardware block** (`dpi`/`sens`/`cm_per_360`/`fov_deg`/`refresh_hz`/`poll_hz`). A hardware-keyed
+  model detects the rig, not behaviour, and those columns are absent from the browser's wire segment
+  at serve time (poll_hz is service-derived, NULL during collection). `train.py` fits the served
+  model on `features_no_hw`; `features_with_hw` survives only as a throwaway leakage diagnostic.
+
+**Still gated on more data / recruitment:**
+- Meaningful metrics need scale (~20 humans + harder, more human-like bots so the detector isn't
+  trivially perfect; more humans with ≥2 sessions so the biometric EER is non-trivial). The
+  archive-and-prune job is built but not yet run.
 
 ## Commands
 
@@ -126,8 +147,9 @@ There is no test runner and no linter — adding one would mean adding dependenc
 The Python pipeline is a **second program** with its own virtualenv (`model/.venv`), its own
 dependency set (`model/requirements.txt`, and `model/serving/requirements.txt` for the service),
 entry points under `model/src/`, and tests in `model/tests/`. Its commands are in `model/DESIGN.md`.
-The code runs today (fetch, features, codec, archive `--dry-run` are live-verified); what does not
-run is any *training* that produces a model, because no data has been collected yet. `bot_driver/`
+The whole pipeline runs today and has produced deployed models (fetch, features, codec, both
+training paths, enrol, artifact upload all live-verified 2026-10-21; archive `--dry-run` verified).
+The only stage not yet run live is the destructive archive-and-prune. `bot_driver/`
 is a third program again (`cd bot_driver && npm install && npx playwright install chromium`, then
 `npm run bot -- …`).
 
@@ -742,14 +764,15 @@ remains:
   answers "is data landing" from the database; a `client_events` table is deferred (`src/TODO.md`
   §2). *(The old "failed `sessions` insert discards the run" defect is fixed — see D.1 /
   `AUDIT-2026-10.md` #4.)*
-- **`model/` now exists as code, but no model is trained yet.** The pipeline, the serving layer
-  and the archive job are built and tested (fixtures + a live read-path run against Supabase:
-  fetch, features, archive `--dry-run`). What does **not** exist is any *trained artifact* — no bot
-  detector and no biometric verifier have been trained, because that is gated on data collection
-  (bot sessions for the detector; ≥2 humans with ≥2 sessions each for the biometric EER, now that
-  the cross-day split requirement has been removed). So you may
-  cite `model/src/*.py` as real, runnable code, but do **not** cite a trained model, an accuracy
-  number or an EER as if it exists — those come after collection.
+- **Both models are trained and deployed, but at proof-of-concept scale — the metrics are not
+  defensible yet.** Treat the *numbers*, not the pipeline, as the open item. The bot detector
+  reports 1.0 only because the current synthetic bots are trivially separable (all permutation
+  importances ~0 — the data is too easy, not the detector good); it needs harder, more human-like
+  bot variants before the number means anything. The biometric EER is ~0.5 (chance) at ~3
+  calibration subjects; it needs more humans with ≥2 sessions each. So you may cite the pipeline,
+  the deployed service, and the models as real — but do **not** cite the accuracy or EER as a
+  capability claim; frame them honestly as proof-of-concept (as `status.html` and the training
+  reports already do).
 
 **Deliberately not defects** (recorded so they aren't "discovered" again): the `predictions` and
 `biometric_templates` tables now exist but are **service-key-only with zero RLS policies** — this is

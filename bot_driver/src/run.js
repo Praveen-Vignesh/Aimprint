@@ -38,6 +38,22 @@ function wrapAngle(a) {
   return a;
 }
 
+// Per-flick reaction delay (ms after the game reports onTarget before firing).
+// Fixed for the easy variants — their constant delay IS part of their
+// fingerprint. A variant that declares reactionSdMs instead gets a right-skewed
+// (log-normal) draw around reactionMs each flick, because human reaction times
+// are variable and skewed; a zero-variance delay is itself a detector tell
+// (time_to_click_ms / dwell_ms both collapse to a constant).
+function sampleReactionMs(controller, rng) {
+  const base = controller.reactionMs;
+  const sd = controller.reactionSdMs ?? 0;
+  if (sd <= 0) return base;
+  const u1 = Math.max(1e-9, rng());
+  const u2 = rng();
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2); // standard normal
+  return Math.max(40, Math.round(base * Math.exp((sd / base) * z)));
+}
+
 // Small seedable PRNG (mulberry32) so a variant's jitter is reproducible per run.
 function makeRng(seed) {
   let s = seed >>> 0;
@@ -207,8 +223,13 @@ export async function runBot({
         onTargetSince = 0;
         framesOnTarget = 0;
         bestErrForTarget = Infinity;
-        // Random arc side for the bezier variant, so curves are not all one way.
+        // Random arc side for the bezier/humanlike variants, so curves are not
+        // all one way.
         state.side = rng() < 0.5 ? -1 : 1;
+        // Sample this flick's reaction delay (constant for the easy variants,
+        // log-normal for humanlike). Held on state so the whole on-target dwell
+        // for this target uses one value.
+        state.reactionMs = sampleReactionMs(controller, rng);
       }
 
       const errMag = Math.hypot(err.yaw, err.pitch);
@@ -258,7 +279,7 @@ export async function runBot({
       if (st.onTarget) {
         if (onTargetSince === 0) onTargetSince = Date.now();
         framesOnTarget++;
-        const settled = Date.now() - onTargetSince >= controller.reactionMs;
+        const settled = Date.now() - onTargetSince >= (state.reactionMs ?? controller.reactionMs);
         if (settled && Date.now() - lastFire > 90) {
           // Click at the CURRENT virtual position so the press injects no
           // spurious movement delta (a differing x,y would read as a turn).

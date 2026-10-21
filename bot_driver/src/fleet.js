@@ -1,6 +1,6 @@
 // Fleet runner — drives the whole synthetic-bot cohort in one command.
 //
-// 5 variants × 3 accounts = 15 synthetic subjects, each playing one 3-minute
+// 6 variants × 3 accounts = 18 synthetic subjects, each playing one 3-minute
 // flick session, run in parallel waves to keep wall-clock down. The accounts
 // must already be provisioned + labelled synthetic (one cohort per variant) by
 // model/src/bot_detection/provision_bot_subjects.py — this just drives them.
@@ -21,7 +21,7 @@ function arg(name, fallback) {
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : fallback;
 }
 
-const VARIANTS = ['linear', 'smooth', 'bezier', 'overshoot', 'jitter'];
+const VARIANTS = ['linear', 'smooth', 'bezier', 'overshoot', 'jitter', 'humanlike'];
 const ACCOUNTS_PER_VARIANT = 3;
 
 // Build the 15-account roster. Emails match the provisioning convention
