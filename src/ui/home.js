@@ -65,7 +65,7 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
   const VERIFY_COPY = {
     [VERIFY_STATES.CHECKING]: { text: 'Checking your play style…', cls: '' },
     [VERIFY_STATES.MATCH]: { text: 'Play style matches your history', cls: 'match' },
-    [VERIFY_STATES.MISMATCH]: { text: 'Play style differs from your usual', cls: 'mismatch' },
+    [VERIFY_STATES.MISMATCH]: { text: 'No match — play style differs from your history', cls: 'mismatch' },
     [VERIFY_STATES.NOT_ENOUGH_HISTORY]: { text: 'Not enough of your history yet to check', cls: '' },
     [VERIFY_STATES.MODEL_NOT_READY]: { text: 'Style check isn’t available yet', cls: '' }
   };
@@ -277,13 +277,21 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
       if (!resultVerify) return;
       const state = typeof input === 'string' ? input : input?.state;
       const matchPercent = typeof input === 'object' ? input?.matchPercent : null;
+      const neededPercent = typeof input === 'object' ? input?.neededPercent : null;
       const copy = VERIFY_COPY[state];
       resultVerify.classList.remove('match', 'mismatch');
       if (!copy) {
         resultVerify.classList.add('hidden');
         return;
       }
-      const pct = typeof matchPercent === 'number' ? ` (${matchPercent}% match)` : '';
+      // A rejected run reads "(51% — 80% needed)", not "(51% match)": the latter
+      // would contradict the "No match" line above it.
+      let pct = '';
+      if (typeof matchPercent === 'number') {
+        pct = state === VERIFY_STATES.MISMATCH && typeof neededPercent === 'number'
+          ? ` (${matchPercent}% — ${neededPercent}% needed)`
+          : ` (${matchPercent}% match)`;
+      }
       resultVerifyLabel.textContent = copy.text + pct;
       if (copy.cls) resultVerify.classList.add(copy.cls);
       resultVerify.classList.remove('hidden');

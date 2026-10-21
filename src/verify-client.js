@@ -54,31 +54,24 @@ export function warmVerifyService({
     .catch(() => {});
 }
 
-// Turns the verifier's raw distance into a 0–100 "match %" anchored on the
-// model's OWN operating threshold: distance 0 → 100%, distance == threshold →
-// 50% (the accept/reject line), distance ≥ 2×threshold → 0%. So accepts read
-// above 50% and rejects below it, and the number is the real model output, not
-// a fabricated one. It is a DEMO figure at the current data scale (EER ≈ 0.5):
-// honest as "the model's similarity score", not as a validated confidence.
-function matchPercentFromDistance(distance, threshold) {
-  if (typeof distance !== 'number' || typeof threshold !== 'number' || threshold <= 0) {
-    return null;
-  }
-  const pct = 100 * (1 - distance / (2 * threshold));
-  return Math.max(0, Math.min(100, Math.round(pct)));
-}
-
-// Verifies one finished session. Returns { state, matchPercent } — matchPercent
-// is null unless the call resolved to a real accept/reject verdict. Never throws
-// and never blocks the caller (callers fire it without awaiting and fill the
-// badge when it resolves). `url`/`fetchImpl` are injectable for tests.
+// Verifies one finished session. Returns { state, matchPercent, neededPercent } —
+// both numbers are null unless the call resolved to a real accept/reject verdict.
+// The match percent and the percent needed to count as a match are computed by
+// the model service (biometric/verify.py MATCH_PERCENT_THRESHOLD) and only
+// displayed here — the browser never decides what counts as a match. Never
+// throws and never blocks the caller (callers fire it without awaiting and fill
+// the badge when it resolves). `url`/`fetchImpl` are injectable for tests.
 export async function verifySession({
   subjectId,
   segments,
   url = defaultVerifyUrl(),
   fetchImpl = typeof fetch === 'function' ? fetch : null
 }) {
-  const result = (state, matchPercent = null) => ({ state, matchPercent });
+  const result = (state, matchPercent = null, neededPercent = null) => ({
+    state,
+    matchPercent,
+    neededPercent
+  });
 
   // Nothing to do, or no way to do it: stay silent (no badge).
   if (!url || !fetchImpl || !subjectId || !Array.isArray(segments) || segments.length === 0) {
@@ -108,8 +101,13 @@ export async function verifySession({
   } catch {
     return result(VERIFY_STATES.UNAVAILABLE);
   }
-  // The endpoint returns { accept, distance, threshold, model_version, note }.
+  // The endpoint returns { accept, match_percent, match_percent_threshold,
+  // distance, threshold, model_version, note }.
   if (typeof body?.accept !== 'boolean') return result(VERIFY_STATES.UNAVAILABLE);
-  const matchPercent = matchPercentFromDistance(body.distance, body.threshold);
-  return result(body.accept ? VERIFY_STATES.MATCH : VERIFY_STATES.MISMATCH, matchPercent);
+  const num = (v) => (typeof v === 'number' ? v : null);
+  return result(
+    body.accept ? VERIFY_STATES.MATCH : VERIFY_STATES.MISMATCH,
+    num(body.match_percent),
+    num(body.match_percent_threshold)
+  );
 }

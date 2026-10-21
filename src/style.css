@@ -268,7 +268,7 @@ section {
 }
 
 .verify-badge.mismatch .verify-label {
-  color: var(--color-accent-soft);
+  color: var(--color-accent);
 }
 
 /* Post-session bot/human readout (results screen). Same quiet treatment as the

@@ -19,7 +19,12 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.biometric import evaluate_biometric  # noqa: E402
 from src.biometric.template import BIOMETRIC_FEATURES, build_template  # noqa: E402
-from src.biometric.verify import BiometricVerifier, template_distance  # noqa: E402
+from src.biometric.verify import (  # noqa: E402
+    MATCH_PERCENT_THRESHOLD,
+    BiometricVerifier,
+    match_percent,
+    template_distance,
+)
 from src.common.features import build_segment_features  # noqa: E402
 
 # Distinct per-subject motor styles (slope, jitter, reaction base) — consistent
@@ -133,6 +138,25 @@ def test_verifier_accept_threshold():
     template = build_template(enrol_df, BIOMETRIC_FEATURES)
     # Own verify session should be accepted at the EER threshold.
     assert verifier.accept(template, verify[0][1]) in (True, False)  # runs without error
+
+
+def test_match_percent_threshold():
+    t = 1.5
+    v = BiometricVerifier(features=list(BIOMETRIC_FEATURES), threshold=t)
+    assert match_percent(0.0, t) == 100
+    assert match_percent(t, t) == 50  # the EER boundary reads 50
+    assert match_percent(2 * t, t) == 0
+    assert match_percent(float("inf"), t) == 0  # no comparable features -> never a pass
+    assert match_percent(1.0, float("inf")) == 0  # unusable threshold -> never a pass
+
+    def distance_at(pct):
+        return 2 * t * (1 - pct / 100)
+
+    assert MATCH_PERCENT_THRESHOLD == 80.0
+    assert v.accept_distance(distance_at(80)) is True
+    assert v.accept_distance(distance_at(79)) is False
+    # A ~51% session sits just inside the EER boundary but is NOT a match.
+    assert v.accept_distance(distance_at(51)) is False
 
 
 def run_all():

@@ -14,6 +14,7 @@ from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.biometric.verify import MATCH_PERCENT_THRESHOLD  # noqa: E402
 from src.common import fetch_telemetry, registry  # noqa: E402
 from src.common.codec import decode_segment  # noqa: E402
 from src.common.features import build_segment_features  # noqa: E402
@@ -92,7 +93,9 @@ def verify(verifier, template: dict, raw_segments: list[dict] | pd.DataFrame) ->
     distance = verifier.distance(template, feats)
     return {
         "distance": distance,
-        "accept": bool(distance < verifier.threshold),
+        "match_percent": verifier.match_percent(distance),
+        "match_percent_threshold": MATCH_PERCENT_THRESHOLD,
+        "accept": verifier.accept_distance(distance),
         "threshold": verifier.threshold,
         "model_version": verifier.model_version,
     }
