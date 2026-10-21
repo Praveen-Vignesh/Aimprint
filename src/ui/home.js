@@ -3,6 +3,7 @@ import { DIFFICULTY_LEVELS } from '../difficulty.js';
 import { createSensitivity } from '../sensitivity.js';
 import { formatClock } from '../hud.js';
 import { VERIFY_STATES } from '../verify-client.js';
+import { BOT_STATES } from '../bot-client.js';
 import {
   SESSION_DURATIONS_MIN,
   SESSION_COMPLETE_FRACTION,
@@ -50,6 +51,8 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
   const resultNote = document.getElementById('result-note');
   const resultVerify = document.getElementById('result-verify');
   const resultVerifyLabel = document.getElementById('result-verify-label');
+  const resultBot = document.getElementById('result-bot');
+  const resultBotLabel = document.getElementById('result-bot-label');
 
   const modeButtons = new Map();
   const difficultyButtons = new Map();
@@ -65,6 +68,17 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
     [VERIFY_STATES.MISMATCH]: { text: 'Play style differs from your usual', cls: 'mismatch' },
     [VERIFY_STATES.NOT_ENOUGH_HISTORY]: { text: 'Not enough of your history yet to check', cls: '' },
     [VERIFY_STATES.MODEL_NOT_READY]: { text: 'Style check isn’t available yet', cls: '' }
+  };
+
+  // Results-screen bot/human readout copy, keyed by bot-client state. OFF and
+  // UNAVAILABLE hide the badge (unconfigured/unreachable stays silent). The
+  // 'human'/'synthetic' classes drive the colour. HUMAN/SYNTHETIC text is a
+  // fallback — setBotState appends the probability when the call returns one.
+  const BOT_COPY = {
+    [BOT_STATES.CHECKING]: { text: 'Scoring this run…', cls: '' },
+    [BOT_STATES.HUMAN]: { text: 'Scored as human play', cls: 'human' },
+    [BOT_STATES.SYNTHETIC]: { text: 'Scored as bot-like play', cls: 'synthetic' },
+    [BOT_STATES.MODEL_NOT_READY]: { text: 'Bot detector isn’t available yet', cls: '' }
   };
 
   // Latest input to the Start gate, so a settings-only re-render does not need
@@ -220,6 +234,10 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
         resultVerify.classList.add('hidden');
         resultVerify.classList.remove('match', 'mismatch');
       }
+      if (resultBot) {
+        resultBot.classList.add('hidden');
+        resultBot.classList.remove('human', 'synthetic');
+      }
 
       const { routineId, difficulty, plannedMs, activeMs } = summary;
       const { hits, attempts, clicks, totalTimeMs, completed, saved } = summary;
@@ -265,6 +283,27 @@ export function createHome({ settings, auth, onStart, onResume, onEndRun, onMenu
       resultVerifyLabel.textContent = copy.text;
       if (copy.cls) resultVerify.classList.add(copy.cls);
       resultVerify.classList.remove('hidden');
+    },
+
+    // Drives the post-session bot/human readout. Accepts either a bare state
+    // string (e.g. 'checking') or the bot-client's { state, botProbability }
+    // object, so the resolved verdict can show the probability. OFF/UNAVAILABLE
+    // (and any unknown state) hide the badge.
+    setBotState(input) {
+      if (!resultBot) return;
+      const state = typeof input === 'string' ? input : input?.state;
+      const botProbability = typeof input === 'object' ? input?.botProbability : null;
+      const copy = BOT_COPY[state];
+      resultBot.classList.remove('human', 'synthetic');
+      if (!copy) {
+        resultBot.classList.add('hidden');
+        return;
+      }
+      const pct =
+        typeof botProbability === 'number' ? ` (${Math.round(botProbability * 100)}% bot-like)` : '';
+      resultBotLabel.textContent = copy.text + pct;
+      if (copy.cls) resultBot.classList.add(copy.cls);
+      resultBot.classList.remove('hidden');
     },
 
     setScreen(screen) {

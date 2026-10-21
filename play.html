@@ -205,6 +205,13 @@
         <span id="result-verify-label" class="verify-label">&mdash;</span>
         <span class="verify-caption">Experimental play-style check — a secondary signal, never a sign-in factor.</span>
       </div>
+      <!-- Bot/human readout, filled asynchronously by the post-session
+           /bot-score call. Demo-facing: the real design hides a player's own bot
+           score; this relaxes that for the showcase. Never a gate. -->
+      <div id="result-bot" class="bot-badge hidden">
+        <span id="result-bot-label" class="bot-label">&mdash;</span>
+        <span class="bot-caption">Experimental bot detector — offline-trained, shown here for the demo.</span>
+      </div>
     </div>
   </div>
 

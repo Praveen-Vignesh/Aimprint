@@ -271,6 +271,45 @@ section {
   color: var(--color-accent-soft);
 }
 
+/* Post-session bot/human readout (results screen). Same quiet treatment as the
+   trust badge — decorative and experimental, shown only for the demo. */
+.bot-badge {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: 4px;
+  background: var(--color-surface-sunken);
+}
+
+/* Pair the bare .hidden with the badge's own display, as .verify-badge.hidden
+   does — otherwise display: flex out-cascades .hidden and the badge can't hide. */
+.bot-badge.hidden {
+  display: none;
+}
+
+.bot-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.bot-caption {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-text-dim);
+}
+
+.bot-badge.human .bot-label {
+  color: var(--color-hit);
+}
+
+.bot-badge.synthetic .bot-label {
+  color: var(--color-accent-soft);
+}
+
 /* Routine grid */
 
 .mode-grid {

@@ -19,6 +19,7 @@ import {
   getSubjectId
 } from './supabase.js';
 import { verifySession, warmVerifyService, VERIFY_STATES } from './verify-client.js';
+import { scoreRun, BOT_STATES } from './bot-client.js';
 import {
   MOUSE_COUNT_SCALE,
   CAMERA_FOV,
@@ -87,31 +88,35 @@ function finishRun() {
   home.renderResults(summary);
   home.setScreen('results');
 
-  // Post-session behavioural-biometric verification: a SECONDARY, decorative
-  // signal, never a gate (canPlay() is untouched). Fired non-blocking after the
-  // results are already on screen — the badge fills in when the call resolves,
-  // and the render loop is never awaited on it.
-  maybeVerifySession(summary);
+  // Post-session model signals: the behavioural-biometric trust badge AND the
+  // bot/human readout. Both are SECONDARY, decorative, never a gate (canPlay()
+  // is untouched). Fired non-blocking after the results are already on screen —
+  // each fills in when its call resolves, and the render loop is never awaited.
+  maybePostRunSignals(summary);
 }
 
-// Sends the finished session's segments to the deployed /verify endpoint and
-// drives the results-screen trust badge. No-op unless the run was actually saved
-// and the player is signed in; stays silent on any failure (verify-client maps
-// network/unconfigured to a hidden badge).
-function maybeVerifySession(summary) {
+// Sends the finished session's segments to the deployed /verify and /bot-score
+// endpoints and drives the two results-screen readouts. No-op unless the run was
+// actually saved and the player is signed in; stays silent on any failure (both
+// clients map network/unconfigured/untrained to a hidden readout). The subject
+// id is resolved once and shared by both calls.
+function maybePostRunSignals(summary) {
   if (summary === null || summary.saved !== true || canPlay() === false) return;
   const segments = summary.segments ?? [];
   if (segments.length === 0) return;
 
   home.setVerifyState(VERIFY_STATES.CHECKING);
+  home.setBotState(BOT_STATES.CHECKING);
   (async () => {
     const subjectId = await getSubjectId();
     if (subjectId === null) {
       home.setVerifyState(VERIFY_STATES.OFF);
+      home.setBotState(BOT_STATES.OFF);
       return;
     }
-    const state = await verifySession({ subjectId, segments });
-    home.setVerifyState(state);
+    // Independent, non-blocking; one slow/absent endpoint never stalls the other.
+    verifySession({ subjectId, segments }).then((state) => home.setVerifyState(state));
+    scoreRun({ subjectId, segments }).then((result) => home.setBotState(result));
   })();
 }
 

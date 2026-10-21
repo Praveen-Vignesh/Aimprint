@@ -15,15 +15,37 @@ signal behind a real auth method.
 
 from __future__ import annotations
 
+import json
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from src.common import artifact_store, registry
 from src.serving import inference
 
-app = FastAPI(title="Aimprint models", version="1")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """On boot, pull the latest trained artifacts from Supabase Storage into the
+    local models/ tree BEFORE any lazy load. This is the serve-only half of the
+    'train offline, Render serves' split: the image ships no model (models/* is
+    gitignored), so the artifact arrives at runtime. Best-effort — a failure
+    leaves the models unavailable and /health/ /status report it honestly rather
+    than crashing the service."""
+    for model_type in ("bot_detection", "biometric"):
+        try:
+            version = artifact_store.download_latest(model_type)
+            print(f"[startup] {model_type}: "
+                  f"{'pulled ' + version if version else 'nothing published yet'}")
+        except Exception as exc:  # network / creds / bucket missing — non-fatal
+            print(f"[startup] {model_type}: artifact sync skipped ({type(exc).__name__})")
+    yield
+
+
+app = FastAPI(title="Aimprint models", version="1", lifespan=lifespan)
 
 # The browser calls /verify cross-origin (the game is on Vercel, this serves on
 # Render), so the site origin must be allow-listed or the fetch is blocked. Only
@@ -58,6 +80,10 @@ def _biometric():
 
 class ScoreRequest(BaseModel):
     segments: list[dict]
+    # The browser's wire segments carry no subject_id (it lives on the session
+    # row, not the segment), so the caller names it here and the scorer stamps it
+    # onto the rows before the subject-level aggregation groups by it.
+    subject_id: str | None = None
 
 
 class VerifyRequest(BaseModel):
@@ -79,12 +105,48 @@ def health():
     return status
 
 
+def _model_status(model_type: str) -> dict:
+    """Latest version + headline metrics for one model type, read straight from
+    the local registry.json (populated by the startup artifact sync). Feeds the
+    recruiter-facing status dashboard — no model is loaded to answer this."""
+    try:
+        reg = registry._registry(model_type)
+        if not reg.exists():
+            return {"available": False}
+        index = json.loads(reg.read_text())
+        if not index:
+            return {"available": False}
+        latest = index[-1]
+        return {
+            "available": True,
+            "model_version": latest.get("model_version"),
+            "chosen_model": latest.get("chosen_model"),
+            "n_features": latest.get("n_features"),
+            "created_at": latest.get("created_at"),
+            # headline is {balanced_accuracy, human_false_positive_rate, roc_auc}
+            # for the bot detector and {eer, n_subjects} for the biometric verifier.
+            "headline": latest.get("headline"),
+        }
+    except Exception as exc:
+        return {"available": False, "error": type(exc).__name__}
+
+
+@app.get("/status")
+def status():
+    """Public, read-only model status for the demo dashboard: which models are
+    live and their headline numbers. Carries no per-player data."""
+    return {
+        "bot_detection": _model_status("bot_detection"),
+        "biometric": _model_status("biometric"),
+    }
+
+
 @app.post("/bot-score")
 def bot_score(req: ScoreRequest):
     if not req.segments:
         raise HTTPException(400, "no segments provided")
     try:
-        return {"predictions": inference.score_bot(_bot(), req.segments)}
+        return {"predictions": inference.score_bot(_bot(), req.segments, req.subject_id)}
     except FileNotFoundError:
         raise HTTPException(503, "bot detector not trained yet")
 

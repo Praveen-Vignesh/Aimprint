@@ -35,3 +35,8 @@ services:
       # https://aimprint.vercel.app + http://localhost:5173.
       - key: CORS_ALLOW_ORIGINS
         sync: false
+      # Optional: the private Supabase Storage bucket the service pulls trained
+      # artifacts from on startup (src/common/artifact_store). Defaults to
+      # "model-artifacts" when unset — set only to override the bucket name.
+      - key: MODEL_ARTIFACT_BUCKET
+        sync: false

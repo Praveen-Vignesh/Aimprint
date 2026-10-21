@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aimprint — model status</title>
+  <meta name="description" content="Live status of Aimprint's behavioural models: the bot detector and the biometric verifier." />
+  <link rel="icon" href="/favicon.svg" />
+  <!-- Self-contained, like index.html / privacy.html: this page does NOT import
+       src/style.css. It is a small standalone dashboard to share with recruiters. -->
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0e0f13;
+      --surface: #16181f;
+      --border: #272a33;
+      --text: #e7e9ee;
+      --dim: #9aa0ab;
+      --ok: #57d08a;
+      --warn: #e0b057;
+      --accent: #ff5555;
+      --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      line-height: 1.5;
+      padding: 48px 16px;
+      display: flex;
+      justify-content: center;
+    }
+
+    main { width: 100%; max-width: 720px; }
+
+    h1 { font-size: 24px; margin: 0 0 4px; }
+
+    .sub { color: var(--dim); font-size: 14px; margin: 0 0 32px; }
+
+    .cards { display: grid; gap: 16px; grid-template-columns: 1fr; }
+
+    @media (min-width: 560px) { .cards { grid-template-columns: 1fr 1fr; } }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    .card h2 { font-size: 15px; margin: 0 0 12px; letter-spacing: 0.02em; }
+
+    .pill {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      color: var(--dim);
+    }
+
+    .pill.live { color: var(--ok); border-color: var(--ok); }
+    .pill.down { color: var(--warn); border-color: var(--warn); }
+
+    dl { margin: 16px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; }
+    dt { color: var(--dim); font-size: 13px; }
+    dd { margin: 0; font-size: 13px; font-variant-numeric: tabular-nums; text-align: right; }
+
+    .note { color: var(--dim); font-size: 12px; margin-top: 32px; }
+    .note strong { color: var(--warn); }
+    a { color: var(--accent); }
+  </style>
+</head>
+
+<body>
+  <main>
+    <h1>Aimprint — model status</h1>
+    <p class="sub" id="endpoint">Checking the live service…</p>
+
+    <div class="cards">
+      <section class="card" id="card-bot">
+        <h2>Bot detector <span class="pill" id="bot-pill">…</span></h2>
+        <dl id="bot-fields"></dl>
+      </section>
+      <section class="card" id="card-bio">
+        <h2>Biometric verifier <span class="pill" id="bio-pill">…</span></h2>
+        <dl id="bio-fields"></dl>
+      </section>
+    </div>
+
+    <p class="note">
+      <strong>Demo / research figures.</strong> At this data scale (≈12 human
+      subjects, a handful of bot variants) these numbers are a proof of concept,
+      not a production accuracy or security claim. The biometric EER is a same-day
+      demonstration metric. <a href="/play">Back to the trainer →</a>
+    </p>
+  </main>
+
+  <script type="module">
+    // Vite inlines import.meta.env at build; guarded for the Node/preview case.
+    let verifyUrl = null;
+    try { verifyUrl = import.meta.env?.VITE_VERIFY_URL ?? null; } catch { verifyUrl = null; }
+
+    const endpointEl = document.getElementById('endpoint');
+
+    const pct = (x) => (typeof x === 'number' ? `${(x * 100).toFixed(1)}%` : '—');
+    const num = (x) => (typeof x === 'number' ? x.toFixed(3) : '—');
+
+    function row(dl, label, value) {
+      const dt = document.createElement('dt');
+      dt.textContent = label;
+      const dd = document.createElement('dd');
+      dd.textContent = value;
+      dl.append(dt, dd);
+    }
+
+    function renderBot(dl, pill, model) {
+      dl.textContent = '';
+      if (!model || model.available !== true) {
+        pill.textContent = 'not trained';
+        pill.className = 'pill down';
+        row(dl, 'Status', 'No artifact published yet');
+        return;
+      }
+      pill.textContent = 'live';
+      pill.className = 'pill live';
+      const h = model.headline ?? {};
+      row(dl, 'Version', model.model_version ?? '—');
+      row(dl, 'Algorithm', model.chosen_model ?? '—');
+      row(dl, 'Balanced accuracy', pct(h.balanced_accuracy));
+      row(dl, 'Human false-positive', pct(h.human_false_positive_rate));
+      row(dl, 'ROC AUC', num(h.roc_auc));
+    }
+
+    function renderBio(dl, pill, model) {
+      dl.textContent = '';
+      if (!model || model.available !== true) {
+        pill.textContent = 'not trained';
+        pill.className = 'pill down';
+        row(dl, 'Status', 'No artifact published yet');
+        return;
+      }
+      pill.textContent = 'live';
+      pill.className = 'pill live';
+      const h = model.headline ?? {};
+      row(dl, 'Version', model.model_version ?? '—');
+      row(dl, 'EER', num(h.eer));
+      row(dl, 'Subjects enrolled', h.n_subjects ?? '—');
+    }
+
+    async function load() {
+      const botPill = document.getElementById('bot-pill');
+      const bioPill = document.getElementById('bio-pill');
+      const botFields = document.getElementById('bot-fields');
+      const bioFields = document.getElementById('bio-fields');
+
+      if (!verifyUrl) {
+        endpointEl.textContent = 'No verify service configured (VITE_VERIFY_URL unset).';
+        renderBot(botFields, botPill, null);
+        renderBio(bioFields, bioPill, null);
+        return;
+      }
+
+      const base = verifyUrl.replace(/\/$/, '');
+      endpointEl.textContent = `Service: ${base}`;
+      try {
+        const res = await fetch(`${base}/status`, { cache: 'no-store' });
+        if (!res.ok) throw new Error(String(res.status));
+        const data = await res.json();
+        renderBot(botFields, botPill, data.bot_detection);
+        renderBio(bioFields, bioPill, data.biometric);
+      } catch {
+        endpointEl.textContent = `Service unreachable: ${base} (it may be waking up — retry in ~1 min).`;
+        renderBot(botFields, botPill, null);
+        renderBio(bioFields, bioPill, null);
+      }
+    }
+
+    load();
+  </script>
+</body>
+
+</html>

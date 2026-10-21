@@ -1,12 +1,26 @@
-supabase>=2.9.0
-python-dotenv>=1.0.1
-pandas>=2.2.0
-pyarrow>=17.0.0
+# Training + offline pipeline deps.
+#
+# PICKLE PORTABILITY (see model/serving/Dockerfile, render.yaml): a .joblib
+# trained here must LOAD on the Render serving image. joblib/pickle do NOT load
+# reliably across differing numpy / scikit-learn / joblib versions, so the
+# artifact-critical libraries below are PINNED to EXACTLY the versions in
+# model/serving/requirements.txt, and training must run on Python 3.13 (the image
+# base). Train on a mismatched stack and the model silently fails to load on
+# Render -> the service stays 503 forever. This is the #1 deploy gotcha.
+supabase==2.33.0
+python-dotenv==1.2.4
+pandas==3.0.6
+pyarrow==26.0.0
+numpy==2.5.4
 
-numpy>=1.26.0
-scikit-learn>=1.5.0
-xgboost>=2.1.0
+# Artifact-critical — MUST match model/serving/requirements.txt exactly so the
+# trained artifact unpickles on the serving image.
+scikit-learn==1.9.1
+joblib==1.6.0
+
+# Training / analysis only — never serialized into a shipped artifact, so these
+# stay unpinned. (xgboost was removed: nothing imports it — the bot detector uses
+# scikit-learn's HistGradientBoosting / RandomForest / LogisticRegression.)
 matplotlib>=3.9.0
 seaborn>=0.13.0
-joblib>=1.4.0
 jupyter>=1.0.0

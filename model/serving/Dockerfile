@@ -1,14 +1,11 @@
-# Deploy-ready image for the model serving layer. NOT built/deployed yet.
+# Serving image for the model layer (Render Blueprint: render.yaml).
 #
 # ⚠️ PICKLE PORTABILITY — the one deployment gotcha:
 # joblib/pickle artifacts do NOT load reliably across Python minor versions or
-# across numpy/sklearn versions. Training currently runs on Python 3.15; this
-# image is 3.13. A 3.15-produced *.joblib WILL likely fail to load here.
-# Before deploying, do ONE of:
-#   (a) retrain inside this image (same stack), or
-#   (b) standardize training and serving on one Python+lib set (pin both).
-# "Deploy-ready" means the structure is in place — not that a cross-version
-# pickle will load.
+# across numpy/sklearn versions. This image is Python 3.13, so TRAINING must run
+# on 3.13 with the same lib versions. model/requirements.txt now pins the
+# artifact-critical libs (scikit-learn, numpy, joblib) to EXACTLY the versions
+# below — keep them in lockstep or a trained *.joblib silently fails to load.
 FROM python:3.13-slim
 
 WORKDIR /app
@@ -17,8 +14,11 @@ WORKDIR /app
 COPY model/serving/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# The code and the trained artifacts. models/ must contain artifacts produced on
-# THIS stack (see the portability note above).
+# The code. Trained artifacts are NOT baked in — models/* is gitignored, so this
+# copies an effectively empty tree. The real artifacts are pulled from the
+# private Supabase Storage bucket at startup (src/serving/app.py lifespan ->
+# src/common/artifact_store.download_latest). The COPY stays only so the dir
+# exists; it is no longer load-bearing.
 COPY model/src /app/src
 COPY model/models /app/models
 

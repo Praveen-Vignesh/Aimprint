@@ -22,15 +22,17 @@ export default defineConfig({
     // Three.js alone exceeds the default 500 kB advisory limit, and it is needed
     // on the first frame, so splitting it out would move bytes without saving any.
     chunkSizeWarningLimit: 800,
-    // Multi-page, not a router. Three entries with three different payloads:
+    // Multi-page, not a router. Four entries with distinct payloads:
     // index.html is the landing page and loads only the Supabase client,
-    // play.html is the game and is the only page that pulls in Three, and
-    // privacy.html is a static document with no JS at all.
+    // play.html is the game and is the only page that pulls in Three,
+    // privacy.html is a static document with no JS, and status.html is a small
+    // standalone model-status dashboard (fetch only, no Three, no Supabase).
     rollupOptions: {
       input: {
         main: fileURLToPath(new URL('./index.html', import.meta.url)),
         play: fileURLToPath(new URL('./play.html', import.meta.url)),
-        privacy: fileURLToPath(new URL('./privacy.html', import.meta.url))
+        privacy: fileURLToPath(new URL('./privacy.html', import.meta.url)),
+        status: fileURLToPath(new URL('./status.html', import.meta.url))
       }
     }
   }

@@ -59,9 +59,18 @@ def load_biometric(version: str | None = None):
     return registry.load("biometric", version)
 
 
-def score_bot(detector, raw_segments: list[dict] | pd.DataFrame) -> list[dict]:
-    """Raw wire-format segments in → per-subject bot verdicts out."""
-    feats = build_segment_features(_decoded_frame(raw_segments))
+def score_bot(detector, raw_segments: list[dict] | pd.DataFrame,
+              subject_id: str | None = None) -> list[dict]:
+    """Raw wire-format segments in → per-subject bot verdicts out. The browser's
+    segments have no subject_id (it is session-scoped, not segment-scoped), so
+    the caller passes it and it is stamped on before the subject-level groupby.
+    The offline path already carries subject_id from the training view and omits
+    it here."""
+    frame = _decoded_frame(raw_segments)
+    if subject_id is not None and "subject_id" not in frame.columns:
+        frame = frame.copy()
+        frame["subject_id"] = subject_id
+    feats = build_segment_features(frame)
     return detector.subject_predict(feats).to_dict(orient="records")
 
 
