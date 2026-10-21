@@ -158,13 +158,23 @@ def main():
     if df.empty:
         sys.exit("No labelled rows after dropping is_human NULL — label subjects first.")
 
-    features_with_hw = FEATURE_COLUMNS + [c for c in HARDWARE_COLUMNS if c in df.columns]
+    # Behaviour only. The served detector is fit on behavioural features
+    # (velocity/trajectory/timing) and NEVER on the session hardware block
+    # (dpi/sens/cm_per_360/fov_deg/refresh_hz/poll_hz). Two reasons, both
+    # load-bearing: (1) a detector that keys on the rig is detecting hardware, not
+    # bot behaviour — trivially spoofable and not a meaningful signal; (2) those
+    # columns are session-scoped and poll_hz is service-derived (NULL during
+    # collection), so they are NOT in the browser's wire segment at serve time —
+    # a model that depends on them mislabels real humans the instant they are
+    # absent. `features_with_hw` is retained ONLY to compute the leakage diagnostic
+    # below (a throwaway CV, never the shipped model).
     features_no_hw = FEATURE_COLUMNS
+    features_with_hw = FEATURE_COLUMNS + [c for c in HARDWARE_COLUMNS if c in df.columns]
     n_human = df.loc[df["is_human"].astype(bool), "subject_id"].nunique()
     n_bot = df.loc[~df["is_human"].astype(bool), "subject_id"].nunique()
     poc = min(n_human, n_bot) < POC_SUBJECT_THRESHOLD
 
-    # Bake-off: nested subject score per family (with the hardware block). A
+    # Bake-off: nested subject score per family (behavioural features only). A
     # single family blowing up on a degenerate fold (e.g. HGB's binning raising
     # "window shape cannot be larger than input array shape" when a subject
     # contributes very few segments, so an inner fold is tiny) must not abort the
@@ -173,7 +183,7 @@ def main():
     bakeoff = {}
     for name, (make_est, grid) in CANDIDATES.items():
         try:
-            bakeoff[name] = _nested_subject_score(make_est, grid, df, features_with_hw, args.outer_splits)
+            bakeoff[name] = _nested_subject_score(make_est, grid, df, features_no_hw, args.outer_splits)
         except Exception as exc:
             bakeoff[name] = None
             print(f"  {name}: skipped ({type(exc).__name__}: {exc})")
@@ -198,22 +208,29 @@ def main():
         "proof_of_concept": bool(poc),
         "bakeoff": bakeoff,
         "chosen_model": chosen,
-        "subject_cv_with_hardware": evaluate.subject_cv(df, chosen_factory, features_with_hw, args.outer_splits),
+        # The served model is behavioural-only; subject_cv_without_hardware is its
+        # honest held-out estimate and feeds the headline. subject_cv_with_hardware
+        # is a LEAKAGE DIAGNOSTIC only (a throwaway CV fit with the hardware block
+        # added) — a large with- vs without-hardware gap would mean the hardware
+        # was carrying the signal. It is never the shipped model.
         "subject_cv_without_hardware": evaluate.subject_cv(df, chosen_factory, features_no_hw, args.outer_splits),
-        "leave_one_bot_cohort_out": evaluate.leave_one_cohort_out(df, chosen_factory, features_with_hw),
-        "permutation_importance": evaluate.permutation_importance_grouped(df, chosen_factory, features_with_hw, args.outer_splits),
+        "subject_cv_with_hardware": evaluate.subject_cv(df, chosen_factory, features_with_hw, args.outer_splits),
+        "leave_one_bot_cohort_out": evaluate.leave_one_cohort_out(df, chosen_factory, features_no_hw),
+        "permutation_importance": evaluate.permutation_importance_grouped(df, chosen_factory, features_no_hw, args.outer_splits),
     }
-    cv = report["subject_cv_with_hardware"]
+    cv = report["subject_cv_without_hardware"]
     report["headline"] = None if "skipped" in cv else {
         "balanced_accuracy": cv["balanced_accuracy"],
         "human_false_positive_rate": cv["human_false_positive_rate"],
         "roc_auc": cv["roc_auc"],
     }
 
-    # Fit the final model on ALL data with tuned params, wrap, persist.
-    final_est, best_params = _tuned_fit(make_est, grid, df, features_with_hw)
+    # Fit the final (served) model on ALL data with tuned params, BEHAVIOURAL
+    # FEATURES ONLY, wrap, persist. features_no_hw is the serving contract: every
+    # column here is present in the browser's wire segment.
+    final_est, best_params = _tuned_fit(make_est, grid, df, features_no_hw)
     detector = HierarchicalBotDetector(
-        final_est, features_with_hw,
+        final_est, features_no_hw,
         meta={"chosen_model": chosen, "best_params": best_params, "bakeoff": bakeoff},
     )
     version = registry.save(detector, report, model_type="bot_detection")

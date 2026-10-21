@@ -31,8 +31,17 @@ class HierarchicalBotDetector:
     # ---- segment level -----------------------------------------------------
     def segment_proba(self, seg_df: pd.DataFrame) -> np.ndarray:
         """P(bot) for each segment row. Column order is pinned to self.features
-        so a reordered/extra-column DataFrame cannot silently misalign."""
-        X = seg_df[self.features].to_numpy(dtype=float)
+        so a reordered/extra-column DataFrame cannot silently misalign.
+
+        reindex (not seg_df[self.features]) so a feature the caller did not supply
+        becomes an all-NaN column instead of raising KeyError. This is the serving
+        contract: the browser's wire segments carry no session-level hardware
+        columns (dpi/sens/cm_per_360/fov_deg/refresh_hz live on the sessions row,
+        and poll_hz is service-derived — NULL during collection, never sent), so
+        /bot-score must tolerate their absence. The fitted pipeline already imputes
+        NaN (SimpleImputer / native NaN support), so a missing column is handled
+        exactly as a missing value was in training rather than 500-ing the call."""
+        X = seg_df.reindex(columns=self.features).to_numpy(dtype=float)
         # Positive class is bot (label 1); find its column in classes_.
         classes = list(self.estimator.classes_)
         bot_col = classes.index(1) if 1 in classes else 1
