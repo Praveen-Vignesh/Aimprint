@@ -31,3 +31,4 @@ model/models/**
 
 *.md
 migrations/
+.claude
