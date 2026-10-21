@@ -22,3 +22,8 @@ model/data/*
 !model/models/.gitkeep
 model/__pycache__/
 model/**/__pycache__/
+
+
+.ua/
+model/models/**
+!model/models/**/.gitkeep
