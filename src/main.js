@@ -56,6 +56,16 @@ const hud = createHud();
 
 const game = createGame({ scene, camera, crosshair, hud, onExpire: () => finishRun() });
 
+// DEV-only test hook for the deterministic bot driver (bot_driver/). It lets the
+// driver read the engaged target + current aim + sensitivity so it can aim by
+// math instead of screenshotting the canvas. `import.meta.env.DEV` is true under
+// `npm run dev` (what the driver points at) and false in the production build,
+// so Vite strips this entirely — it never ships to Vercel and does NOT
+// reintroduce the removed in-browser "bot mode".
+if (import.meta.env.DEV) {
+  window.__aimbot = () => ({ ...game.aimState(), pointerSpeed: controls.pointerSpeed });
+}
+
 // idle | running | paused. Pointer lock is no longer the session boundary, so
 // the lock/unlock events alone cannot say whether a lock starts a run or resumes
 // one — and an unlock we caused ourselves must not reopen the pause screen.

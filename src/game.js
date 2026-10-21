@@ -401,6 +401,25 @@ export function createGame({ scene, camera, crosshair, hud, onExpire = () => {} 
   document.addEventListener('mousedown', onMouseDown);
 
   return {
+    // Read-only snapshot of the engaged target and current aim, for a DEV-only
+    // test driver (main.js gates the window exposure behind import.meta.env.DEV,
+    // so this is never reachable in a production build). `target` is the engaged
+    // target's world position + radius (camera sits at the origin, so this is
+    // also the direction to it); `onTarget` is the game's own crosshair raycast.
+    aimState() {
+      const engaged = engagedTarget();
+      const { yaw, pitch } = cameraAngles();
+      return {
+        target: engaged
+          ? { x: engaged.position.x, y: engaged.position.y, z: engaged.position.z,
+              r: engaged.userData.radius }
+          : null,
+        yaw,
+        pitch,
+        onTarget: raycastCenter() !== null
+      };
+    },
+
     update(now) {
       if (running === false) return;
 

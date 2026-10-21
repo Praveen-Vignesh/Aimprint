@@ -164,10 +164,20 @@ def main():
     n_bot = df.loc[~df["is_human"].astype(bool), "subject_id"].nunique()
     poc = min(n_human, n_bot) < POC_SUBJECT_THRESHOLD
 
-    # Bake-off: nested subject score per family (with the hardware block).
+    # Bake-off: nested subject score per family (with the hardware block). A
+    # single family blowing up on a degenerate fold (e.g. HGB's binning raising
+    # "window shape cannot be larger than input array shape" when a subject
+    # contributes very few segments, so an inner fold is tiny) must not abort the
+    # whole bake-off — treat it as unscored and let the surviving families
+    # compete.
     bakeoff = {}
     for name, (make_est, grid) in CANDIDATES.items():
-        bakeoff[name] = _nested_subject_score(make_est, grid, df, features_with_hw, args.outer_splits)
+        try:
+            bakeoff[name] = _nested_subject_score(make_est, grid, df, features_with_hw, args.outer_splits)
+        except Exception as exc:
+            bakeoff[name] = None
+            print(f"  {name}: skipped ({type(exc).__name__}: {exc})")
+            continue
         print(f"  {name}: {bakeoff[name]}")
 
     scored = {k: v for k, v in bakeoff.items() if v and v["balanced_accuracy"] is not None}

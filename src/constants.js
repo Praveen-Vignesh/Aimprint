@@ -92,7 +92,7 @@ export const SAMPLING_VERSION = 1;
 // run is one a contributor will actually repeat; a 10-min run is where they
 // quietly drop out. planned_duration_ms is on the session row, so a mixed set of
 // lengths stays filterable offline regardless.
-export const SESSION_DURATIONS_MIN = [5, 10, 15];
+export const SESSION_DURATIONS_MIN = [3, 5, 10, 15];
 export const DEFAULT_SESSION_DURATION_MIN = 5;
 export const MS_PER_MINUTE = 60000;
 

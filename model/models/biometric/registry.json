@@ -1,0 +1,12 @@
+[
+  {
+    "model_version": "20261021-biometric_distance-cc38b501",
+    "created_at": "2026-10-21T02:34:49.023879+00:00",
+    "chosen_model": "biometric_distance",
+    "n_features": 19,
+    "headline": {
+      "eer": 0.5,
+      "n_subjects": 2
+    }
+  }
+]
