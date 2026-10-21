@@ -1,0 +1,19 @@
+{
+  "eer": 0.5,
+  "far_at_eer": 0.6666666666666666,
+  "frr_at_eer": 0.3333333333333333,
+  "threshold": 1.4700401992440075,
+  "eer_method": "loso",
+  "in_sample_eer": 0.3333333333333333,
+  "n_genuine": 3,
+  "n_impostor": 6,
+  "mean_genuine_distance": 0.8694265537690402,
+  "mean_impostor_distance": 1.8324070046204346,
+  "n_subjects": 3,
+  "enrol_sessions": 3,
+  "proof_of_concept": true,
+  "headline": {
+    "eer": 0.5,
+    "n_subjects": 3
+  }
+}
