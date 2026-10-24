@@ -2,8 +2,16 @@ node_modules
 dist
 dist-ssr
 *.local
-.env.local
+.env
+.env.*
+!.env.example
 CLAUDE.md
+
+# keys / certs (never commit)
+*.pem
+*.key
+*.p12
+*.pfx
 
 logs
 *.log
@@ -13,10 +21,12 @@ npm-debug.log*
 .vscode/*
 !.vscode/extensions.json
 .idea
+.claude
+.gstack
 
 # model/ (offline Python bot-detection pipeline)
 model/.env
-model/.venv/
+model/.venv*/
 model/data/*
 !model/data/.gitkeep
 !model/models/.gitkeep
@@ -29,6 +39,5 @@ model/models/**
 !model/models/**/.gitkeep
 
 
-*.md
+docs/
 migrations/
-.claude

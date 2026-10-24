@@ -24,7 +24,7 @@ function arg(name, fallback) {
 const VARIANTS = ['linear', 'smooth', 'bezier', 'overshoot', 'jitter', 'humanlike'];
 const ACCOUNTS_PER_VARIANT = 3;
 
-// Build the 15-account roster. Emails match the provisioning convention
+// Build the 18-account roster. Emails match the provisioning convention
 // bot-<variant>-<n>@aimprint-test.local; cohort = bot_<variant> is already set
 // on each subject server-side, so it is not needed here. `only` (e.g.
 // "bezier-1,overshoot-2") restricts the run to a subset — used to re-run only
@@ -47,7 +47,11 @@ function roster(only) {
 
 async function main() {
   const url = arg('url', 'http://localhost:5173');
-  const password = arg('password', 'botfleet2026');
+  const password = arg('password');
+  if (!password) {
+    console.error('Required: --password (the shared password printed by provision_bot_subjects.py)');
+    process.exit(1);
+  }
   const durationMin = Number(arg('duration', '3'));
   const headless = arg('headless', 'false') === 'true';
   const waveSize = Number(arg('wave', '5'));
